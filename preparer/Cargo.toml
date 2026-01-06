@@ -1,0 +1,12 @@
+[package]
+name = "preparer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gstreamer = "0.24.4"
+gstreamer-audio = "0.24.4"
+gstreamer-video = "0.24.4"
+gstreamer-base = "0.24.4"
+mkv-element = "0.3.1"
+anyhow = "1.0.100"

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Synchronized DASH Movie Watching</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            }
+
+            h1 {
+                color: #333;
+                text-align: center;
+            }
+
+            .player-container {
+                position: relative;
+                width: 100%;
+                max-width: 100%;
+                aspect-ratio: 16/9;
+                background-color: black;
+                margin-bottom: 20px;
+            }
+
+            #videoPlayer {
+                width: 100%;
+                height: 100%;
+            }
+
+            .controls {
+                display: flex;
+                gap: 10px;
+                margin-bottom: 20px;
+                align-items: center;
+            }
+
+            button {
+                padding: 8px 16px;
+                background-color: #4caf50;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+            }
+
+            button:hover {
+                background-color: #45a049;
+            }
+
+            .status {
+                margin-top: 20px;
+                padding: 10px;
+                background-color: #e9f7ef;
+                border-radius: 4px;
+                border-left: 4px solid #4caf50;
+            }
+
+            .client-count {
+                font-weight: bold;
+                color: #4caf50;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Synchronized DASH Movie Watching</h1>
+
+            <div id="videoContainer" class="player-container">
+                <video id="videoPlayer" width="640"></video>
+                <div class="controls">
+                    <button id="play">Play</button>
+                    <button id="pause">Paws</button>
+                    <input
+                        type="range"
+                        id="seekBar"
+                        min="0"
+                        max="100"
+                        value="0"
+                        step="0.1"
+                    />
+                    <button id="fullscreen">Fullscreen</button>
+                </div>
+            </div>
+
+            <div class="status">
+                <p>
+                    Connected clients:
+                    <span class="client-count" id="clientCount">1</span>
+                </p>
+                <p id="statusMessage">Waiting for synchronization...</p>
+                <p id="bufferStatusMessage"></p>
+            </div>
+        </div>
+
+        <!-- Load bundled client script -->
+        <script src="/dist/client.js" type="module"></script>
+    </body>
+</html>
