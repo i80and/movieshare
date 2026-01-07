@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use std::env;
+use std::fs;
+use std::path::Path;
 
 struct EncodingBranch {
     queue1: gst::Element,
@@ -13,6 +15,80 @@ struct EncodingBranch {
     queue3: gst::Element,
     parser: gst::Element,
     queue4: gst::Element,
+}
+
+struct SubtitleBranch {
+    queue: gst::Element,
+    text_overlay: gst::Element,
+    png_encoder: gst::Element,
+    png_sink: gst::Element,
+    webvtt_sink: gst::Element,
+}
+
+impl SubtitleBranch {
+    fn new(output_dir: &str, track_id: usize) -> Result<Self> {
+        // Create subtitle output directory
+        let subtitle_dir = Path::new(output_dir).join(format!("subtitles_{}", track_id));
+        fs::create_dir_all(&subtitle_dir)
+            .context(format!("Failed to create subtitle directory: {}", subtitle_dir.display()))?;
+
+        Ok(Self {
+            queue: gst::ElementFactory::make("queue").build()?,
+            text_overlay: gst::ElementFactory::make("textoverlay")
+                .property("font-desc", "Sans, 24")
+                .property("color", 0xFFFFFFFFu32) // White
+                .property("outline-color", 0x000000FFu32) // Black outline
+                .property("halignment", "center")
+                .property("valignment", "bottom")
+                .build()?,
+            png_encoder: gst::ElementFactory::make("pngenc").build()?,
+            png_sink: gst::ElementFactory::make("multifilesink")
+                .property("location", subtitle_dir.join("frame_%05d.png").to_str().unwrap())
+                .build()?,
+            webvtt_sink: gst::ElementFactory::make("filesink")
+                .property("location", subtitle_dir.join("subtitles.vtt").to_str().unwrap())
+                .build()?,
+        })
+    }
+
+    fn add_to_pipeline(&self, pipeline: &gst::Pipeline) -> Result<()> {
+        pipeline.add_many(&[
+            &self.queue,
+            &self.text_overlay,
+            &self.png_encoder,
+            &self.png_sink,
+            &self.webvtt_sink,
+        ])?;
+        Ok(())
+    }
+
+    fn link(&self, tee: &gst::Element) -> Result<()> {
+        // Link from tee to subtitle processing
+        tee.link(&self.queue)?;
+        self.queue.link(&self.text_overlay)?;
+        
+        // Create a tee to split the stream for both PNG and WebVTT output
+        let subtitle_tee = gst::ElementFactory::make("tee").build()?;
+        self.text_overlay.link(&subtitle_tee)?;
+        
+        // PNG branch
+        let png_queue = gst::ElementFactory::make("queue").build()?;
+        subtitle_tee.link(&png_queue)?;
+        png_queue.link(&self.png_encoder)?;
+        self.png_encoder.link(&self.png_sink)?;
+        
+        // WebVTT branch (would need webvttenc element, but it's not commonly available)
+        // For now, we'll just create a placeholder
+        let webvtt_queue = gst::ElementFactory::make("queue").build()?;
+        subtitle_tee.link(&webvtt_queue)?;
+        // Note: In a real implementation, you would need a webvttenc element here
+        // webvtt_queue.link(&self.webvtt_sink)?;
+        
+        // TODO: Implement proper WebVTT generation when webvttenc becomes available
+        // For now, the PNG frames are generated and can be used with a separate WebVTT file
+        
+        Ok(())
+    }
 }
 
 impl EncodingBranch {
@@ -195,6 +271,10 @@ fn main() -> Result<()> {
     // Handle dynamic pads from decodebin
     let tee_weak = tee.downgrade();
     let audio_queue1_weak = audio_queue1.downgrade();
+    let output_dir_clone = output_dir.to_string();
+    let pipeline_weak = pipeline.downgrade();
+    
+    let subtitle_track_counter = std::sync::atomic::AtomicUsize::new(0);
 
     decodebin.connect_pad_added(move |_dbin, src_pad| {
         let tee = match tee_weak.upgrade() {
@@ -204,6 +284,11 @@ fn main() -> Result<()> {
 
         let audio_queue1 = match audio_queue1_weak.upgrade() {
             Some(q) => q,
+            None => return,
+        };
+
+        let pipeline = match pipeline_weak.upgrade() {
+            Some(p) => p,
             None => return,
         };
 
@@ -226,6 +311,25 @@ fn main() -> Result<()> {
                     .link(&sink_pad)
                     .expect("Failed to link decodebin audio to queue");
             }
+        } else if name.starts_with("text/") || name.starts_with("subtitle/") {
+            // Handle subtitle tracks
+            let track_id = subtitle_track_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            
+            println!("Detected subtitle track {}, setting up processing...", track_id);
+            
+            // Create a new tee for subtitles
+            let subtitle_tee = gst::ElementFactory::make("tee").name(&format!("subtitle_tee_{}", track_id)).build().unwrap();
+            pipeline.add(&subtitle_tee).unwrap();
+            
+            // Link decodebin to subtitle tee
+            src_pad.link(&subtitle_tee.static_pad("sink").unwrap()).unwrap();
+            
+            // Create subtitle branch
+            let subtitle_branch = SubtitleBranch::new(&output_dir_clone, track_id).unwrap();
+            subtitle_branch.add_to_pipeline(&pipeline).unwrap();
+            subtitle_branch.link(&subtitle_tee).unwrap();
+            
+            println!("Subtitle track {} processing set up successfully", track_id);
         }
     });
 
