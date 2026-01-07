@@ -5,9 +5,8 @@ use std::env;
 
 struct EncodingBranch {
     queue1: gst::Element,
-    videoscale: gst::Element,
+    vaapipostproc: gst::Element,
     capsfilter: gst::Element,
-    videoconvert: gst::Element,
     queue2: gst::Element,
     encoder: gst::Element,
     queue3: gst::Element,
@@ -16,7 +15,7 @@ struct EncodingBranch {
 }
 
 impl EncodingBranch {
-    fn new(bitrate_mbps: u32, preset: u32, keyframe_interval: u32) -> Result<Self> {
+    fn new(bitrate_mbps: u32, keyframe_interval: u32) -> Result<Self> {
         let bitrate_kbps = bitrate_mbps * 1000; // Convert MB/s to kbps
 
         // Capsfilter to limit resolution to 1080p
@@ -27,21 +26,14 @@ impl EncodingBranch {
 
         Ok(Self {
             queue1: gst::ElementFactory::make("queue").build()?,
-            videoscale: gst::ElementFactory::make("videoscale")
-                .property_from_str("method", "lanczos")
-                .build()?,
+            vaapipostproc: gst::ElementFactory::make("vaapipostproc").build()?,
             capsfilter: gst::ElementFactory::make("capsfilter")
                 .property("caps", &caps)
                 .build()?,
-            videoconvert: gst::ElementFactory::make("videoconvert")
-                .property_from_str("dither", "bayer")
-                .property_from_str("chroma-mode", "full")
-                .build()?,
             queue2: gst::ElementFactory::make("queue").build()?,
-            encoder: gst::ElementFactory::make("svtav1enc")
-                .property("preset", preset)
-                .property("target-bitrate", bitrate_kbps)
-                .property("intra-period-length", keyframe_interval as i32)
+            encoder: gst::ElementFactory::make("vaav1enc")
+                .property("bitrate", bitrate_kbps)
+                .property("key-int-max", keyframe_interval as u32)
                 .build()?,
             queue3: gst::ElementFactory::make("queue").build()?,
             parser: gst::ElementFactory::make("av1parse").build()?,
@@ -52,9 +44,8 @@ impl EncodingBranch {
     fn add_to_pipeline(&self, pipeline: &gst::Pipeline) -> Result<()> {
         pipeline.add_many(&[
             &self.queue1,
-            &self.videoscale,
+            &self.vaapipostproc,
             &self.capsfilter,
-            &self.videoconvert,
             &self.queue2,
             &self.encoder,
             &self.queue3,
@@ -68,11 +59,10 @@ impl EncodingBranch {
         // Link from tee
         tee.link(&self.queue1)?;
 
-        // Link the encoding chain with scaling and conversion
-        self.queue1.link(&self.videoscale)?;
-        self.videoscale.link(&self.capsfilter)?;
-        self.capsfilter.link(&self.videoconvert)?;
-        self.videoconvert.link(&self.queue2)?;
+        // Link the encoding chain with VA-API postprocessing
+        self.queue1.link(&self.vaapipostproc)?;
+        self.vaapipostproc.link(&self.capsfilter)?;
+        self.capsfilter.link(&self.queue2)?;
         self.queue2.link(&self.encoder)?;
         self.encoder.link(&self.queue3)?;
         self.queue3.link(&self.parser)?;
@@ -112,7 +102,6 @@ fn main() -> Result<()> {
 
     // Define bitrates in MB/s
     let bitrates = vec![6, 2]; // Can easily add more: vec![8, 6, 4, 2, 1]
-    let encoder_preset = 8u32;
     let target_duration = 4u32; // seconds
 
     // Calculate keyframe interval (assuming 30fps, adjust if needed)
@@ -186,7 +175,7 @@ fn main() -> Result<()> {
     // Create and link encoding branches
     let mut branches = Vec::new();
     for bitrate in bitrates {
-        let branch = EncodingBranch::new(bitrate, encoder_preset, keyframe_interval)?;
+        let branch = EncodingBranch::new(bitrate, keyframe_interval)?;
         branch.add_to_pipeline(&pipeline)?;
         branch.link(&tee, &dashsink)?;
         branches.push(branch);
