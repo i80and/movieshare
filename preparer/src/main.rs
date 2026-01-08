@@ -1,7 +1,26 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use std::env;
+
+mod quality_ladder;
+use quality_ladder::parse_quality_ladder;
+
+/// Command line arguments
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Input file path
+    input_file: String,
+    
+    /// Output directory
+    output_directory: String,
+    
+    /// Quality ladder in format: resolution@bitrate:resolution@bitrate (e.g., 1080@6000:480@1500)
+    /// Default: 1080@6000
+    #[arg(short, long, default_value = "1080@6000")]
+    quality_ladder: String,
+}
 
 struct EncodingBranch {
     queue1: gst::Element,
@@ -15,13 +34,23 @@ struct EncodingBranch {
 }
 
 impl EncodingBranch {
-    fn new(bitrate_mbps: u32, keyframe_interval: u32) -> Result<Self> {
-        let bitrate_kbps = bitrate_mbps * 1000; // Convert MB/s to kbps
+    fn new(resolution: u32, bitrate_kbps: u32, keyframe_interval: u32) -> Result<Self> {
+        // Calculate max width and height based on resolution
+        let (max_width, max_height) = match resolution {
+            2160 => (3840, 2160), // 4K
+            1440 => (2560, 1440), // 2K
+            1080 => (1920, 1080), // 1080p
+            720 => (1280, 720),   // 720p
+            480 => (854, 480),    // 480p
+            360 => (640, 360),    // 360p
+            240 => (426, 240),    // 240p
+            _ => (1920, 1080),    // Default to 1080p if unknown
+        };
 
-        // Capsfilter to limit resolution to 1080p
+        // Capsfilter to limit resolution
         let caps = gst::Caps::builder("video/x-raw")
-            .field("width", gst::IntRange::new(1, 1920))
-            .field("height", gst::IntRange::new(1, 1080))
+            .field("width", gst::IntRange::new(1, max_width))
+            .field("height", gst::IntRange::new(1, max_height))
             .build();
 
         Ok(Self {
@@ -88,27 +117,26 @@ impl EncodingBranch {
     }
 }
 
+
+
 fn main() -> Result<()> {
     // Initialize GStreamer
     gst::init()?;
 
-    // Parse command line arguments
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <input-file> <output-directory>", args[0]);
-        eprintln!("Example: {} test.webm ./output", args[0]);
-        std::process::exit(1);
-    }
+    // Parse command line arguments using clap
+    let args = Args::parse();
 
-    let input_file = &args[1];
-    let output_dir = &args[2];
+    let input_file = args.input_file;
+    let output_dir = args.output_directory;
 
     // Ensure output directory exists
-    std::fs::create_dir_all(output_dir)
+    std::fs::create_dir_all(&output_dir)
         .context(format!("Failed to create output directory: {}", output_dir))?;
 
-    // Define bitrates in MB/s
-    let bitrates = vec![6, 2]; // Can easily add more: vec![8, 6, 4, 2, 1]
+    // Parse quality ladder
+    let quality_ladder = parse_quality_ladder(&args.quality_ladder)?;
+    println!("Using quality ladder: {:?}", quality_ladder);
+    
     let target_duration = 4u32; // seconds
 
     // Calculate keyframe interval (assuming 30fps, adjust if needed)
@@ -122,7 +150,7 @@ fn main() -> Result<()> {
     // Create source and decoder elements
     let filesrc = gst::ElementFactory::make("filesrc")
         .name("filesrc")
-        .property("location", input_file)
+        .property("location", &input_file)
         .build()?;
 
     let decodebin = gst::ElementFactory::make("decodebin").name("d").build()?;
@@ -144,7 +172,7 @@ fn main() -> Result<()> {
     // DASH sink with output directory
     let dashsink = gst::ElementFactory::make("dashsink")
         .property("mpd-filename", "manifest.mpd")
-        .property("mpd-root-path", output_dir)
+        .property("mpd-root-path", &output_dir)
         .property("target-duration", target_duration)
         .property_from_str("muxer", "dashmp4")
         .build()?;
@@ -188,8 +216,8 @@ fn main() -> Result<()> {
 
     // Create and link encoding branches
     let mut branches = Vec::new();
-    for bitrate in bitrates {
-        let branch = EncodingBranch::new(bitrate, keyframe_interval)?;
+    for (resolution, bitrate_kbps) in quality_ladder {
+        let branch = EncodingBranch::new(resolution, bitrate_kbps, keyframe_interval)?;
         branch.add_to_pipeline(&pipeline)?;
         branch.link(&tee, &dashsink)?;
         branches.push(branch);
