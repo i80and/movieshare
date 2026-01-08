@@ -12,14 +12,66 @@ use quality_ladder::parse_quality_ladder;
 struct Args {
     /// Input file path
     input_file: String,
-    
+
     /// Output directory
     output_directory: String,
-    
+
     /// Quality ladder in format: resolution@bitrate:resolution@bitrate (e.g., 1080@6000:480@1500)
     /// Default: 1080@6000
     #[arg(short, long, default_value = "1080@6000")]
     quality_ladder: String,
+
+    /// Encoder to use for AV1 encoding
+    /// Options: vaapi (vaav1enc) or svtav1 (svtav1enc)
+    /// Default: vaapi
+    #[arg(long, default_value = "vaapi")]
+    encoder: String,
+
+    /// Preset for SVT-AV1 encoder (only used when encoder is svtav1)
+    /// Common presets: 0-13 (0=fastest, 13=best quality)
+    #[arg(long, requires = "encoder")]
+    svtav1_preset: Option<u32>,
+}
+
+/// Encoder choice for AV1 encoding
+#[derive(Debug, Clone, Copy)]
+enum EncoderChoice {
+    Vaapi,  // Use vaav1enc (VA-API hardware acceleration)
+    SvtAv1, // Use svtav1enc (software-based SVT-AV1 encoder)
+}
+
+impl std::fmt::Display for EncoderChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncoderChoice::Vaapi => write!(f, "vaapi (vaav1enc)"),
+            EncoderChoice::SvtAv1 => write!(f, "svtav1 (svtav1enc)"),
+        }
+    }
+}
+
+/// Encoder configuration
+#[derive(Debug, Clone)]
+struct EncoderConfig {
+    choice: EncoderChoice,
+    svtav1_preset: Option<u32>, // Only used for SvtAv1 encoder
+}
+
+impl EncoderConfig {
+    fn from_args(encoder_str: &str, svtav1_preset: Option<u32>) -> Result<Self> {
+        let choice = match encoder_str.to_lowercase().as_str() {
+            "vaapi" => EncoderChoice::Vaapi,
+            "svtav1" => EncoderChoice::SvtAv1,
+            other => anyhow::bail!(
+                "Invalid encoder choice: {}. Expected 'vaapi' or 'svtav1'",
+                other
+            ),
+        };
+
+        Ok(Self {
+            choice,
+            svtav1_preset,
+        })
+    }
 }
 
 struct EncodingBranch {
@@ -34,7 +86,12 @@ struct EncodingBranch {
 }
 
 impl EncodingBranch {
-    fn new(resolution: u32, bitrate_kbps: u32, keyframe_interval: u32) -> Result<Self> {
+    fn new(
+        resolution: u32,
+        bitrate_kbps: u32,
+        keyframe_interval: u32,
+        encoder_config: &EncoderConfig,
+    ) -> Result<Self> {
         // Calculate max width and height based on resolution
         let (max_width, max_height) = match resolution {
             2160 => (3840, 2160), // 4K
@@ -53,6 +110,31 @@ impl EncodingBranch {
             .field("height", gst::IntRange::new(1, max_height))
             .build();
 
+        // Create encoder based on configuration
+        let encoder = match encoder_config.choice {
+            EncoderChoice::Vaapi => {
+                let encoder = gst::ElementFactory::make("vaav1enc")
+                    .build()
+                    .with_context(|| "vaav1enc encoder not available. Make sure VA-API and AV1 encoding support are installed.")?;
+                encoder.set_property("bitrate", bitrate_kbps);
+                encoder.set_property("key-int-max", keyframe_interval as u32);
+                encoder
+            }
+            EncoderChoice::SvtAv1 => {
+                let encoder = gst::ElementFactory::make("svtav1enc")
+                    .build()
+                    .with_context(|| "svtav1enc encoder not available. Make sure SVT-AV1 encoder is installed.")?;
+                encoder.set_property("target-bitrate", bitrate_kbps);
+                encoder.set_property("intra-period-length", keyframe_interval as i32);
+
+                // Set preset if provided
+                if let Some(preset) = encoder_config.svtav1_preset {
+                    encoder.set_property("preset", preset);
+                }
+                encoder
+            }
+        };
+
         Ok(Self {
             queue1: gst::ElementFactory::make("queue").build()?,
             vaapipostproc: gst::ElementFactory::make("vaapipostproc").build()?,
@@ -60,10 +142,7 @@ impl EncodingBranch {
                 .property("caps", &caps)
                 .build()?,
             queue2: gst::ElementFactory::make("queue").build()?,
-            encoder: gst::ElementFactory::make("vaav1enc")
-                .property("bitrate", bitrate_kbps)
-                .property("key-int-max", keyframe_interval as u32)
-                .build()?,
+            encoder,
             queue3: gst::ElementFactory::make("queue").build()?,
             parser: gst::ElementFactory::make("av1parse").build()?,
             queue4: gst::ElementFactory::make("queue").build()?,
@@ -117,8 +196,6 @@ impl EncodingBranch {
     }
 }
 
-
-
 fn main() -> Result<()> {
     // Initialize GStreamer
     gst::init()?;
@@ -136,7 +213,14 @@ fn main() -> Result<()> {
     // Parse quality ladder
     let quality_ladder = parse_quality_ladder(&args.quality_ladder)?;
     println!("Using quality ladder: {:?}", quality_ladder);
-    
+
+    // Parse encoder configuration
+    let encoder_config = EncoderConfig::from_args(&args.encoder, args.svtav1_preset)?;
+    println!("Using encoder: {}", encoder_config.choice);
+    if let Some(preset) = encoder_config.svtav1_preset {
+        println!("Using SVT-AV1 preset: {}", preset);
+    }
+
     let target_duration = 4u32; // seconds
 
     // Calculate keyframe interval (assuming 30fps, adjust if needed)
@@ -217,7 +301,8 @@ fn main() -> Result<()> {
     // Create and link encoding branches
     let mut branches = Vec::new();
     for (resolution, bitrate_kbps) in quality_ladder {
-        let branch = EncodingBranch::new(resolution, bitrate_kbps, keyframe_interval)?;
+        let branch =
+            EncodingBranch::new(resolution, bitrate_kbps, keyframe_interval, &encoder_config)?;
         branch.add_to_pipeline(&pipeline)?;
         branch.link(&tee, &dashsink)?;
         branches.push(branch);

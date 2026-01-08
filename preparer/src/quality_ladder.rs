@@ -19,31 +19,38 @@ use anyhow::{Context, Result};
 
 pub fn parse_quality_ladder(quality_ladder: &str) -> Result<Vec<(u32, u32)>> {
     let mut ladder = Vec::new();
-    
+
     for part in quality_ladder.split(':') {
         let part = part.trim();
         if part.is_empty() {
             continue; // Skip empty parts
         }
-        
+
         let parts: Vec<&str> = part.split('@').collect();
         if parts.len() != 2 {
-            anyhow::bail!("Invalid quality ladder format. Expected resolution@bitrate, got: {}", part);
+            anyhow::bail!(
+                "Invalid quality ladder format. Expected resolution@bitrate, got: {}",
+                part
+            );
         }
-        
-        let resolution = parts[0].trim().parse::<u32>()
+
+        let resolution = parts[0]
+            .trim()
+            .parse::<u32>()
             .context(format!("Failed to parse resolution from: {}", parts[0]))?;
-        
-        let bitrate_kbps = parts[1].trim().parse::<u32>()
+
+        let bitrate_kbps = parts[1]
+            .trim()
+            .parse::<u32>()
             .context(format!("Failed to parse bitrate from: {}", parts[1]))?;
-            
+
         ladder.push((resolution, bitrate_kbps));
     }
-    
+
     if ladder.is_empty() {
         anyhow::bail!("Quality ladder cannot be empty");
     }
-    
+
     Ok(ladder)
 }
 
@@ -66,12 +73,10 @@ mod tests {
     #[test]
     fn test_parse_multiple_qualities() {
         let result = parse_quality_ladder("2160@12000:1080@8000:720@4000:480@2000").unwrap();
-        assert_eq!(result, vec![
-            (2160, 12000),
-            (1080, 8000),
-            (720, 4000),
-            (480, 2000)
-        ]);
+        assert_eq!(
+            result,
+            vec![(2160, 12000), (1080, 8000), (720, 4000), (480, 2000)]
+        );
     }
 
     #[test]
