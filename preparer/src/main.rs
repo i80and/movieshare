@@ -92,22 +92,13 @@ impl EncodingBranch {
         keyframe_interval: u32,
         encoder_config: &EncoderConfig,
     ) -> Result<Self> {
-        // Calculate max width and height based on resolution
-        let (max_width, max_height) = match resolution {
-            2160 => (3840, 2160), // 4K
-            1440 => (2560, 1440), // 2K
-            1080 => (1920, 1080), // 1080p
-            720 => (1280, 720),   // 720p
-            480 => (854, 480),    // 480p
-            360 => (640, 360),    // 360p
-            240 => (426, 240),    // 240p
-            _ => (1920, 1080),    // Default to 1080p if unknown
-        };
+        // Treat resolution as target height and let GStreamer preserve aspect ratio
+        // This allows automatic width determination based on the source aspect ratio
+        let target_height = resolution as i32;
 
-        // Capsfilter to limit resolution
+        // Capsfilter to limit height only, allowing GStreamer to preserve aspect ratio
         let caps = gst::Caps::builder("video/x-raw")
-            .field("width", gst::IntRange::new(1, max_width))
-            .field("height", gst::IntRange::new(1, max_height))
+            .field("height", gst::IntRange::new(1, target_height))
             .build();
 
         // Create encoder based on configuration
