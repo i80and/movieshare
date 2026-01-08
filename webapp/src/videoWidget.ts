@@ -67,11 +67,18 @@ export class VideoWidget extends TypedEventTarget<VideoWidgetEventMap> {
   public isBuffered(): boolean {
     const buffered = this.video.buffered;
     const currentTime = this.video.currentTime;
+    const duration = this.video.duration;
 
     for (let i = 0; i < buffered.length; i++) {
       if (currentTime >= buffered.start(i) && currentTime <= buffered.end(i)) {
         const bufferedSeconds = buffered.end(i) - currentTime;
-        return bufferedSeconds >= BUFFER_THRESHOLD_SECONDS;
+        const remainingSeconds = duration - currentTime;
+
+        console.log(bufferedSeconds);
+
+        // Either we have enough buffer, OR we're buffered to the end
+        return bufferedSeconds >= BUFFER_THRESHOLD_SECONDS ||
+          bufferedSeconds >= remainingSeconds;
       }
     }
     return false;

@@ -75,7 +75,14 @@ impl EncodingBranch {
         self.parser.link_filtered(&self.queue4, &caps)?;
 
         // Link to dashsink
-        self.queue4.link(dashsink)?;
+        let video_sink_pad = dashsink
+            .request_pad_simple("video_%u")
+            .context("Failed to get video pad from dashsink")?;
+        let video_src_pad = self
+            .queue4
+            .static_pad("src")
+            .context("Failed to get src pad from queue4")?;
+        video_src_pad.link(&video_sink_pad)?;
 
         Ok(())
     }
@@ -170,7 +177,14 @@ fn main() -> Result<()> {
         .build();
     audio_queue2.link_filtered(&opusenc, &audio_caps)?;
     opusenc.link(&audio_queue3)?;
-    audio_queue3.link(&dashsink)?;
+
+    let audio_sink_pad = dashsink
+        .request_pad_simple("audio_%u")
+        .context("Failed to get audio pad from dashsink")?;
+    let audio_src_pad = audio_queue3
+        .static_pad("src")
+        .context("Failed to get src pad from audio_queue3")?;
+    audio_src_pad.link(&audio_sink_pad)?;
 
     // Create and link encoding branches
     let mut branches = Vec::new();
