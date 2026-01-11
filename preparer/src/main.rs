@@ -83,6 +83,8 @@ struct EncodingBranch {
     queue3: gst::Element,
     parser: gst::Element,
     queue4: gst::Element,
+    qtmux: gst::Element,
+    filesink: gst::Element,
 }
 
 impl EncodingBranch {
@@ -91,6 +93,7 @@ impl EncodingBranch {
         bitrate_kbps: u32,
         keyframe_interval: u32,
         encoder_config: &EncoderConfig,
+        output_dir: &str,
     ) -> Result<Self> {
         // Treat resolution as target height and let GStreamer preserve aspect ratio
         // This allows automatic width determination based on the source aspect ratio
@@ -126,6 +129,17 @@ impl EncodingBranch {
             }
         };
 
+        // Create qtmux for fragmented MP4 output
+        let qtmux = gst::ElementFactory::make("qtmux")
+            .property("fragment-duration", 4000u32) // 4 seconds per fragment
+            .build()?;
+
+        // Create filesink with appropriate filename
+        let output_filename = format!("{}/video_{}p.mp4", output_dir, resolution);
+        let filesink = gst::ElementFactory::make("filesink")
+            .property("location", &output_filename)
+            .build()?;
+
         Ok(Self {
             queue1: gst::ElementFactory::make("queue").build()?,
             vaapipostproc: gst::ElementFactory::make("vaapipostproc").build()?,
@@ -137,6 +151,8 @@ impl EncodingBranch {
             queue3: gst::ElementFactory::make("queue").build()?,
             parser: gst::ElementFactory::make("av1parse").build()?,
             queue4: gst::ElementFactory::make("queue").build()?,
+            qtmux,
+            filesink,
         })
     }
 
@@ -150,11 +166,13 @@ impl EncodingBranch {
             &self.queue3,
             &self.parser,
             &self.queue4,
+            &self.qtmux,
+            &self.filesink,
         ])?;
         Ok(())
     }
 
-    fn link(&self, tee: &gst::Element, dashsink: &gst::Element) -> Result<()> {
+    fn link(&self, tee: &gst::Element) -> Result<()> {
         // Link from tee
         tee.link(&self.queue1)?;
 
@@ -173,15 +191,9 @@ impl EncodingBranch {
             .build();
         self.parser.link_filtered(&self.queue4, &caps)?;
 
-        // Link to dashsink
-        let video_sink_pad = dashsink
-            .request_pad_simple("video_%u")
-            .context("Failed to get video pad from dashsink")?;
-        let video_src_pad = self
-            .queue4
-            .static_pad("src")
-            .context("Failed to get src pad from queue4")?;
-        video_src_pad.link(&video_sink_pad)?;
+        // Link to qtmux and filesink
+        self.queue4.link(&self.qtmux)?;
+        self.qtmux.link(&self.filesink)?;
 
         Ok(())
     }
@@ -244,12 +256,15 @@ fn main() -> Result<()> {
 
     let audio_queue3 = gst::ElementFactory::make("queue").build()?;
 
-    // DASH sink with output directory
-    let dashsink = gst::ElementFactory::make("dashsink")
-        .property("mpd-filename", "manifest.mpd")
-        .property("mpd-root-path", &output_dir)
-        .property("target-duration", target_duration)
-        .property_from_str("muxer", "dashmp4")
+    // Audio qtmux for fragmented MP4 output
+    let audio_qtmux = gst::ElementFactory::make("qtmux")
+        .property("fragment-duration", 4000u32) // 4 seconds per fragment
+        .build()?;
+
+    // Audio filesink
+    let audio_output_filename = format!("{}/audio.mp4", output_dir);
+    let audio_filesink = gst::ElementFactory::make("filesink")
+        .property("location", &audio_output_filename)
         .build()?;
 
     // Add base elements to pipeline
@@ -263,7 +278,8 @@ fn main() -> Result<()> {
         &audio_queue2,
         &opusenc,
         &audio_queue3,
-        &dashsink,
+        &audio_qtmux,
+        &audio_filesink,
     ])?;
 
     // Link static elements
@@ -280,22 +296,16 @@ fn main() -> Result<()> {
         .build();
     audio_queue2.link_filtered(&opusenc, &audio_caps)?;
     opusenc.link(&audio_queue3)?;
-
-    let audio_sink_pad = dashsink
-        .request_pad_simple("audio_%u")
-        .context("Failed to get audio pad from dashsink")?;
-    let audio_src_pad = audio_queue3
-        .static_pad("src")
-        .context("Failed to get src pad from audio_queue3")?;
-    audio_src_pad.link(&audio_sink_pad)?;
+    audio_queue3.link(&audio_qtmux)?;
+    audio_qtmux.link(&audio_filesink)?;
 
     // Create and link encoding branches
     let mut branches = Vec::new();
-    for (resolution, bitrate_kbps) in quality_ladder {
+    for &(resolution, bitrate_kbps) in &quality_ladder {
         let branch =
-            EncodingBranch::new(resolution, bitrate_kbps, keyframe_interval, &encoder_config)?;
+            EncodingBranch::new(resolution, bitrate_kbps, keyframe_interval, &encoder_config, &output_dir)?;
         branch.add_to_pipeline(&pipeline)?;
-        branch.link(&tee, &dashsink)?;
+        branch.link(&tee)?;
         branches.push(branch);
     }
 
@@ -337,9 +347,10 @@ fn main() -> Result<()> {
     });
 
     // Start playing
-    println!("Starting transcoding...");
+    println!("Starting fMP4 generation...");
     println!("Input: {}", input_file);
-    println!("Output: {}", output_dir);
+    println!("Output directory: {}", output_dir);
+    println!("Generating fragmented MP4 files suitable for DASH streaming");
 
     pipeline.set_state(gst::State::Playing)?;
 
@@ -350,7 +361,13 @@ fn main() -> Result<()> {
 
         match msg.view() {
             MessageView::Eos(..) => {
-                println!("Transcoding complete!");
+                println!("fMP4 generation complete!");
+                println!("Generated files:");
+                for (resolution, _) in &quality_ladder {
+                    println!("  - video_{}p.mp4", resolution);
+                }
+                println!("  - audio.mp4");
+                println!("Files are ready for DASH streaming (use with any DASH packager)");
                 break;
             }
             MessageView::Error(err) => {
