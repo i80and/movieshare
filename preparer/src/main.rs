@@ -482,7 +482,17 @@ fn main() -> Result<()> {
     };
 
     // Create audio processing pipelines for each stream
+    // Track language usage to handle duplicates
+    use std::collections::HashMap;
+    let mut language_counts: HashMap<String, usize> = HashMap::new();
+
     for audio_stream in audio_streams {
+        // Count occurrences of each language
+        let count = language_counts
+            .entry(audio_stream.language.clone())
+            .or_insert(0);
+        *count += 1;
+
         let audio_queue1 = gst::ElementFactory::make("queue").build()?;
         let audioconvert = gst::ElementFactory::make("audioconvert").build()?;
         let audioresample = gst::ElementFactory::make("audioresample").build()?;
@@ -500,14 +510,30 @@ fn main() -> Result<()> {
             .build()?;
 
         // Audio filesink - write to temp directory with language code
-        let audio_output_filename = format!("{}/audio_{}.mp4", temp_path, audio_stream.language);
+        // Add stream index if there are duplicate language codes
+        let language_suffix = if *count > 1 {
+            format!("_{}", audio_stream.stream_index)
+        } else {
+            String::new()
+        };
+        let audio_output_filename = format!(
+            "{}/audio_{}{}.mp4",
+            temp_path, audio_stream.language, language_suffix
+        );
         let audio_filesink = gst::ElementFactory::make("filesink")
             .property("location", &audio_output_filename)
             .build()?;
 
+        // Store the actual output filename for packager
+        let output_language = if *count > 1 {
+            format!("_{}", audio_stream.stream_index)
+        } else {
+            audio_stream.language.clone()
+        };
+
         audio_processors.push(AudioProcessor {
             stream_index: audio_stream.stream_index,
-            language: audio_stream.language.clone(),
+            language: output_language,
             description: audio_stream.description.clone(),
             subtitles: audio_stream.subtitles.clone(),
             queue1: audio_queue1,
