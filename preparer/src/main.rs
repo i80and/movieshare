@@ -33,11 +33,20 @@ const SEGMENT_DURATION_SEC: u32 = 4; // Duration of each segment in seconds
 const AUDIO_BITRATE: u32 = 192000; // Bitrate for audio in bits per second
 
 /// Load configuration from TOML file
-fn load_config(config_path: &str) -> Result<Config> {
+fn load_config(config_path: &str) -> Result<(Config, String)> {
     let config_content = std::fs::read_to_string(config_path)
         .context(format!("Failed to read config file: {}", config_path))?;
 
-    toml::from_str(&config_content).context("Failed to parse TOML configuration")
+    let config = toml::from_str(&config_content).context("Failed to parse TOML configuration")?;
+
+    // Get the directory containing the config file
+    let config_dir = std::path::Path::new(config_path)
+        .parent()
+        .context("Failed to get parent directory of config file")?
+        .to_string_lossy()
+        .into_owned();
+
+    Ok((config, config_dir))
 }
 
 /// Command line arguments
@@ -400,15 +409,21 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load configuration from TOML file if provided
-    let config = if let Some(config_path) = args.config {
-        Some(load_config(&config_path)?)
+    let (config, config_dir) = if let Some(config_path) = args.config {
+        let (config, config_dir) = load_config(&config_path)?;
+        (Some(config), Some(config_dir))
     } else {
-        None
+        (None, None)
     };
 
     // Determine input file path
     let input_file = if let Some(config) = &config {
-        config.input.path.clone()
+        let config_dir = config_dir
+            .as_ref()
+            .context("Config directory should be available when config is loaded")?;
+        // Resolve input path relative to config file directory
+        let input_path = std::path::Path::new(config_dir).join(&config.input.path);
+        input_path.to_string_lossy().into_owned()
     } else if let Some(input_file) = args.input_file {
         input_file
     } else {
