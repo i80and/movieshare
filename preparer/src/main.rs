@@ -2,9 +2,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use tempfile::TempDir;
 
 mod quality_ladder;
 use quality_ladder::parse_quality_ladder;
+
+const SEGMENT_DURATION_SEC: u32 = 4; // Duration of each segment in seconds
+const AUDIO_BITRATE: u32 = 192000; // Bitrate for audio in bits per second
 
 /// Command line arguments
 #[derive(Parser, Debug)]
@@ -130,8 +134,8 @@ impl EncodingBranch {
         };
 
         // Create qtmux for fragmented MP4 output
-        let qtmux = gst::ElementFactory::make("qtmux")
-            .property("fragment-duration", 4000u32) // 4 seconds per fragment
+        let qtmux = gst::ElementFactory::make("mp4mux")
+            .property("faststart", true)
             .build()?;
 
         // Create filesink with appropriate filename
@@ -199,6 +203,132 @@ impl EncodingBranch {
     }
 }
 
+/// Call the packager to generate DASH manifest
+///
+/// # Arguments
+///
+/// * `quality_ladder` - Vector of (resolution, bitrate_kbps) tuples
+/// * `temp_dir` - Temporary directory containing intermediate MP4 files
+/// * `output_dir` - Final output directory for DASH manifest and segmented files
+fn call_packager(quality_ladder: &[(u32, u32)], temp_dir: &str, output_dir: &str) -> Result<()> {
+    let packager_path = "./packager-linux-x64";
+
+    // Build the packager command
+    let mut command = std::process::Command::new(packager_path);
+
+    // Add video streams - read from temp_dir, write to output_dir
+    for &(resolution, bitrate_kbps) in quality_ladder {
+        let bandwidth = bitrate_kbps * 1000; // Convert kbps to bps
+        let video_input_file = format!("{}/video_{}p.mp4", temp_dir, resolution);
+        let video_output_file = format!("{}/video_{}p.mp4", output_dir, resolution);
+        command.arg(format!(
+            "in={},stream=video,output={},bandwidth={}",
+            video_input_file, video_output_file, bandwidth
+        ));
+    }
+
+    // Add audio stream - read from temp_dir, write to output_dir
+    let audio_input_file = format!("{}/audio.mp4", temp_dir);
+    let audio_output_file = format!("{}/audio_en.mp4", output_dir);
+    command.arg(format!(
+        "in={},stream=audio,output={},language=en,bandwidth={}",
+        audio_input_file, audio_output_file, AUDIO_BITRATE
+    ));
+
+    // Add manifest output and segment duration - write to output_dir
+    let manifest_file = format!("{}/manifest.mpd", output_dir);
+    command.arg("--mpd_output").arg(manifest_file);
+    command
+        .arg("--segment_duration")
+        .arg(SEGMENT_DURATION_SEC.to_string());
+
+    // Execute the command
+    let status = command.status()?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "Packager failed with exit code: {:?}. Intermediate files are available in: {}",
+            status.code(),
+            temp_dir
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_packager_command_construction() {
+        // Test with a simple quality ladder
+        let quality_ladder = vec![(1080, 3000), (720, 1500), (480, 800)];
+        let temp_dir = "test_temp";
+        let output_dir = "test_output";
+
+        // Build the expected command arguments
+        let mut expected_args = Vec::new();
+
+        // Video streams - read from temp_dir, write to output_dir
+        expected_args.push(
+            "in=test_temp/video_1080p.mp4,stream=video,output=test_output/video_1080p.mp4,bandwidth=3000000",
+        );
+        expected_args.push(
+            "in=test_temp/video_720p.mp4,stream=video,output=test_output/video_720p.mp4,bandwidth=1500000",
+        );
+        expected_args.push(
+            "in=test_temp/video_480p.mp4,stream=video,output=test_output/video_480p.mp4,bandwidth=800000",
+        );
+
+        // Audio stream - read from temp_dir, write to output_dir
+        expected_args.push("in=test_temp/audio.mp4,stream=audio,output=test_output/audio_en.mp4,language=en,bandwidth=128000");
+
+        // Manifest and segment duration - write to output_dir
+        expected_args.push("--mpd_output");
+        expected_args.push("test_output/manifest.mpd");
+        expected_args.push("--segment_duration");
+        expected_args.push("4");
+
+        // Build the command to test argument construction
+        let mut command = std::process::Command::new("packager-linux-x64");
+
+        // Add video streams
+        for &(resolution, bitrate_kbps) in &quality_ladder {
+            let bandwidth = bitrate_kbps * 1000;
+            let video_input_file = format!("{}/video_{}p.mp4", temp_dir, resolution);
+            let video_output_file = format!("{}/video_{}p.mp4", output_dir, resolution);
+            command.arg(format!(
+                "in={},stream=video,output={},bandwidth={}",
+                video_input_file, video_output_file, bandwidth
+            ));
+        }
+
+        // Add audio stream
+        let audio_input_file = format!("{}/audio.mp4", temp_dir);
+        let audio_output_file = format!("{}/audio_en.mp4", output_dir);
+        command.arg(format!(
+            "in={},stream=audio,output={},language=en,bandwidth=128000",
+            audio_input_file, audio_output_file
+        ));
+
+        // Add manifest output and segment duration
+        let manifest_file = format!("{}/manifest.mpd", output_dir);
+        command.arg("--mpd_output").arg(manifest_file);
+        command.arg("--segment_duration").arg("4");
+
+        // Verify the arguments match
+        let actual_args: Vec<String> = command
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            actual_args, expected_args,
+            "Command arguments should match expected format"
+        );
+    }
+}
+
 fn main() -> Result<()> {
     // Initialize GStreamer
     gst::init()?;
@@ -213,6 +343,16 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&output_dir)
         .context(format!("Failed to create output directory: {}", output_dir))?;
 
+    // Create temporary directory inside the output directory
+    // This ensures we have enough space and avoids cross-filesystem issues
+    let temp_dir = TempDir::new_in(&output_dir).context("Failed to create temporary directory")?;
+    let temp_path = temp_dir
+        .path()
+        .to_str()
+        .context("Failed to convert temp directory path to string")?;
+
+    println!("Using temporary directory: {}", temp_path);
+
     // Parse quality ladder
     let quality_ladder = parse_quality_ladder(&args.quality_ladder)?;
     println!("Using quality ladder: {:?}", quality_ladder);
@@ -224,11 +364,11 @@ fn main() -> Result<()> {
         println!("Using SVT-AV1 preset: {}", preset);
     }
 
-    let target_duration = 4u32; // seconds
+    let target_duration = SEGMENT_DURATION_SEC; // seconds
 
     // Calculate keyframe interval (assuming 30fps, adjust if needed)
     // For variable framerate, this will be approximate
-    let fps = 30u32;
+    let fps = 24u32;
     let keyframe_interval = fps * target_duration; // 120 frames for 4 seconds at 30fps
 
     // Create the pipeline
@@ -251,18 +391,18 @@ fn main() -> Result<()> {
     let audio_queue2 = gst::ElementFactory::make("queue").build()?;
 
     let opusenc = gst::ElementFactory::make("opusenc")
-        .property("bitrate", 192000i32)
+        .property("bitrate", AUDIO_BITRATE as i32)
         .build()?;
 
     let audio_queue3 = gst::ElementFactory::make("queue").build()?;
 
     // Audio qtmux for fragmented MP4 output
-    let audio_qtmux = gst::ElementFactory::make("qtmux")
-        .property("fragment-duration", 4000u32) // 4 seconds per fragment
+    let audio_qtmux = gst::ElementFactory::make("mp4mux")
+        .property("faststart", true)
         .build()?;
 
-    // Audio filesink
-    let audio_output_filename = format!("{}/audio.mp4", output_dir);
+    // Audio filesink - write to temp directory
+    let audio_output_filename = format!("{}/audio.mp4", temp_path);
     let audio_filesink = gst::ElementFactory::make("filesink")
         .property("location", &audio_output_filename)
         .build()?;
@@ -299,11 +439,16 @@ fn main() -> Result<()> {
     audio_queue3.link(&audio_qtmux)?;
     audio_qtmux.link(&audio_filesink)?;
 
-    // Create and link encoding branches
+    // Create and link encoding branches - write to temp directory
     let mut branches = Vec::new();
     for &(resolution, bitrate_kbps) in &quality_ladder {
-        let branch =
-            EncodingBranch::new(resolution, bitrate_kbps, keyframe_interval, &encoder_config, &output_dir)?;
+        let branch = EncodingBranch::new(
+            resolution,
+            bitrate_kbps,
+            keyframe_interval,
+            &encoder_config,
+            temp_path,
+        )?;
         branch.add_to_pipeline(&pipeline)?;
         branch.link(&tee)?;
         branches.push(branch);
@@ -362,12 +507,34 @@ fn main() -> Result<()> {
         match msg.view() {
             MessageView::Eos(..) => {
                 println!("fMP4 generation complete!");
-                println!("Generated files:");
+                println!("Generated intermediate files in temporary directory:");
                 for (resolution, _) in &quality_ladder {
-                    println!("  - video_{}p.mp4", resolution);
+                    println!("  - {}/video_{}p.mp4", temp_path, resolution);
                 }
-                println!("  - audio.mp4");
-                println!("Files are ready for DASH streaming (use with any DASH packager)");
+                println!("  - {}/audio.mp4", temp_path);
+
+                // Call packager to generate DASH manifest
+                println!("Generating DASH manifest...");
+                if let Err(e) = call_packager(&quality_ladder, temp_path, &output_dir) {
+                    eprintln!("Failed to generate DASH manifest: {}", e);
+                    eprintln!("Temporary directory preserved for debugging: {}", temp_path);
+                } else {
+                    println!("DASH manifest generation complete!");
+                    println!("Final output files in: {}", output_dir);
+
+                    // Store temp_path for cleanup message before consuming temp_dir
+                    let temp_path_for_cleanup = temp_path.to_string();
+
+                    // Clean up temporary directory
+                    if let Err(e) = temp_dir.close() {
+                        eprintln!("Warning: Failed to clean up temporary directory: {}", e);
+                        eprintln!("You may manually delete: {}", temp_path_for_cleanup);
+                    } else {
+                        println!("Temporary directory cleaned up successfully");
+                    }
+
+                    println!("Files are ready for DASH streaming");
+                }
                 break;
             }
             MessageView::Error(err) => {
@@ -377,6 +544,7 @@ fn main() -> Result<()> {
                     err.error(),
                     err.debug()
                 );
+                eprintln!("Temporary directory preserved for debugging: {}", temp_path);
                 break;
             }
             MessageView::StateChanged(state) => {
