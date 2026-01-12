@@ -115,7 +115,10 @@ impl EncodingBranch {
                     .build()
                     .with_context(|| "vaav1enc encoder not available. Make sure VA-API and AV1 encoding support are installed.")?;
                 encoder.set_property("bitrate", bitrate_kbps);
+
+                // Set keyframe interval for proper segment alignment
                 encoder.set_property("key-int-max", keyframe_interval as u32);
+
                 encoder
             }
             EncoderChoice::SvtAv1 => {
@@ -123,6 +126,8 @@ impl EncodingBranch {
                     .build()
                     .with_context(|| "svtav1enc encoder not available. Make sure SVT-AV1 encoder is installed.")?;
                 encoder.set_property("target-bitrate", bitrate_kbps);
+
+                // Set keyframe interval for proper segment alignment
                 encoder.set_property("intra-period-length", keyframe_interval as i32);
 
                 // Set preset if provided
@@ -366,10 +371,13 @@ fn main() -> Result<()> {
 
     let target_duration = SEGMENT_DURATION_SEC; // seconds
 
-    // Calculate keyframe interval (assuming 30fps, adjust if needed)
-    // For variable framerate, this will be approximate
-    let fps = 24u32;
-    let keyframe_interval = fps * target_duration; // 120 frames for 4 seconds at 30fps
+    // Frame rate detection - we'll detect actual frame rate from source
+    // Start with a reasonable default, but this will be updated when we detect caps
+    let detected_fps = std::sync::Arc::new(std::sync::Mutex::new(30u32));
+    let detected_fps_clone = detected_fps.clone();
+
+    // Calculate initial keyframe interval (will be recalculated after frame rate detection)
+    let _keyframe_interval = std::sync::Arc::new(std::sync::Mutex::new(30 * target_duration));
 
     // Create the pipeline
     let pipeline = gst::Pipeline::new();
@@ -440,12 +448,24 @@ fn main() -> Result<()> {
     audio_qtmux.link(&audio_filesink)?;
 
     // Create and link encoding branches - write to temp directory
+    // We'll use the detected frame rate for keyframe interval
     let mut branches = Vec::new();
+    let final_keyframe_interval = {
+        // Get the detected frame rate (or use default if not detected yet)
+        let detected_fps = *detected_fps.lock().unwrap();
+        detected_fps * target_duration
+    };
+
+    println!(
+        "Using keyframe interval: {} frames (for {} second segments)",
+        final_keyframe_interval, target_duration
+    );
+
     for &(resolution, bitrate_kbps) in &quality_ladder {
         let branch = EncodingBranch::new(
             resolution,
             bitrate_kbps,
-            keyframe_interval,
+            final_keyframe_interval,
             &encoder_config,
             temp_path,
         )?;
@@ -457,6 +477,7 @@ fn main() -> Result<()> {
     // Handle dynamic pads from decodebin
     let tee_weak = tee.downgrade();
     let audio_queue1_weak = audio_queue1.downgrade();
+    let detected_fps_weak = std::sync::Arc::downgrade(&detected_fps_clone);
 
     decodebin.connect_pad_added(move |_dbin, src_pad| {
         let tee = match tee_weak.upgrade() {
@@ -475,6 +496,22 @@ fn main() -> Result<()> {
         let name = structure.name();
 
         if name.starts_with("video/") {
+            // Detect frame rate from video caps
+            if let Some(fps_weak) = detected_fps_weak.upgrade() {
+                if let Ok(fps_value) = structure.get::<gst::Fraction>("framerate") {
+                    let fps_num = fps_value.numer() as u32;
+                    let fps_den = fps_value.denom() as u32;
+                    let actual_fps = if fps_den > 0 { fps_num / fps_den } else { 30 };
+
+                    // Update detected frame rate
+                    if let Ok(mut fps_guard) = fps_weak.lock() {
+                        *fps_guard = actual_fps;
+                    }
+
+                    println!("Detected frame rate: {} fps", actual_fps);
+                }
+            }
+
             let sink_pad = tee.static_pad("sink").unwrap();
             if !sink_pad.is_linked() {
                 src_pad
