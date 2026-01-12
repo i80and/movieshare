@@ -2,20 +2,55 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 mod quality_ladder;
 use quality_ladder::parse_quality_ladder;
 
+/// Configuration structure for TOML input
+#[derive(Debug, Serialize, Deserialize)]
+struct Config {
+    input: InputConfig,
+    audio_streams: Vec<AudioStreamConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InputConfig {
+    path: String,
+    video_stream_index: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AudioStreamConfig {
+    stream_index: usize,
+    language: String,
+    description: String,
+    subtitles: Vec<usize>,
+}
+
 const SEGMENT_DURATION_SEC: u32 = 4; // Duration of each segment in seconds
 const AUDIO_BITRATE: u32 = 192000; // Bitrate for audio in bits per second
+
+/// Load configuration from TOML file
+fn load_config(config_path: &str) -> Result<Config> {
+    let config_content = std::fs::read_to_string(config_path)
+        .context(format!("Failed to read config file: {}", config_path))?;
+
+    toml::from_str(&config_content).context("Failed to parse TOML configuration")
+}
 
 /// Command line arguments
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Input file path
-    input_file: String,
+    /// TOML configuration file for input streams
+    #[arg(long)]
+    config: Option<String>,
+
+    /// Input file path (required if no config file)
+    #[arg(long = "input-file")]
+    input_file: Option<String>,
 
     /// Output directory
     output_directory: String,
@@ -35,6 +70,22 @@ struct Args {
     /// Common presets: 0-13 (0=fastest, 13=best quality)
     #[arg(long, requires = "encoder")]
     svtav1_preset: Option<u32>,
+}
+
+/// Audio processor for handling individual audio streams
+struct AudioProcessor {
+    stream_index: usize,
+    language: String,
+    description: String,
+    subtitles: Vec<usize>,
+    queue1: gst::Element,
+    audioconvert: gst::Element,
+    audioresample: gst::Element,
+    queue2: gst::Element,
+    opusenc: gst::Element,
+    queue3: gst::Element,
+    qtmux: gst::Element,
+    filesink: gst::Element,
 }
 
 /// Encoder choice for AV1 encoding
@@ -215,7 +266,12 @@ impl EncodingBranch {
 /// * `quality_ladder` - Vector of (resolution, bitrate_kbps) tuples
 /// * `temp_dir` - Temporary directory containing intermediate MP4 files
 /// * `output_dir` - Final output directory for DASH manifest and segmented files
-fn call_packager(quality_ladder: &[(u32, u32)], temp_dir: &str, output_dir: &str) -> Result<()> {
+fn call_packager(
+    quality_ladder: &[(u32, u32)],
+    audio_processors: &[AudioProcessor],
+    temp_dir: &str,
+    output_dir: &str,
+) -> Result<()> {
     let packager_path = "./packager-linux-x64";
 
     // Build the packager command
@@ -232,13 +288,15 @@ fn call_packager(quality_ladder: &[(u32, u32)], temp_dir: &str, output_dir: &str
         ));
     }
 
-    // Add audio stream - read from temp_dir, write to output_dir
-    let audio_input_file = format!("{}/audio.mp4", temp_dir);
-    let audio_output_file = format!("{}/audio_en.mp4", output_dir);
-    command.arg(format!(
-        "in={},stream=audio,output={},language=en,bandwidth={}",
-        audio_input_file, audio_output_file, AUDIO_BITRATE
-    ));
+    // Add audio streams - read from temp_dir, write to output_dir
+    for audio_processor in audio_processors {
+        let audio_input_file = format!("{}/audio_{}.mp4", temp_dir, audio_processor.language);
+        let audio_output_file = format!("{}/audio_{}.mp4", output_dir, audio_processor.language);
+        command.arg(format!(
+            "in={},stream=audio,output={},language={},bandwidth={}",
+            audio_input_file, audio_output_file, audio_processor.language, AUDIO_BITRATE
+        ));
+    }
 
     // Add manifest output and segment duration - write to output_dir
     let manifest_file = format!("{}/manifest.mpd", output_dir);
@@ -341,7 +399,22 @@ fn main() -> Result<()> {
     // Parse command line arguments using clap
     let args = Args::parse();
 
-    let input_file = args.input_file;
+    // Load configuration from TOML file if provided
+    let config = if let Some(config_path) = args.config {
+        Some(load_config(&config_path)?)
+    } else {
+        None
+    };
+
+    // Determine input file path
+    let input_file = if let Some(config) = &config {
+        config.input.path.clone()
+    } else if let Some(input_file) = args.input_file {
+        input_file
+    } else {
+        anyhow::bail!("Either --config or --input-file must be provided");
+    };
+
     let output_dir = args.output_directory;
 
     // Ensure output directory exists
@@ -392,60 +465,99 @@ fn main() -> Result<()> {
 
     let tee = gst::ElementFactory::make("tee").name("t").build()?;
 
-    // Audio processing elements
-    let audio_queue1 = gst::ElementFactory::make("queue").build()?;
-    let audioconvert = gst::ElementFactory::make("audioconvert").build()?;
-    let audioresample = gst::ElementFactory::make("audioresample").build()?;
-    let audio_queue2 = gst::ElementFactory::make("queue").build()?;
+    // Audio processing elements - we'll create these for each audio stream
+    let mut audio_processors = Vec::new();
 
-    let opusenc = gst::ElementFactory::make("opusenc")
-        .property("bitrate", AUDIO_BITRATE as i32)
-        .build()?;
+    // Get audio streams from config or use default
+    let audio_streams: Vec<AudioStreamConfig> = if let Some(config) = &config {
+        config.audio_streams.clone()
+    } else {
+        // Default to single English audio stream with index 0
+        vec![AudioStreamConfig {
+            stream_index: 0,
+            language: "en".to_string(),
+            description: "English Audio".to_string(),
+            subtitles: vec![0],
+        }]
+    };
 
-    let audio_queue3 = gst::ElementFactory::make("queue").build()?;
+    // Create audio processing pipelines for each stream
+    for audio_stream in audio_streams {
+        let audio_queue1 = gst::ElementFactory::make("queue").build()?;
+        let audioconvert = gst::ElementFactory::make("audioconvert").build()?;
+        let audioresample = gst::ElementFactory::make("audioresample").build()?;
+        let audio_queue2 = gst::ElementFactory::make("queue").build()?;
 
-    // Audio qtmux for fragmented MP4 output
-    let audio_qtmux = gst::ElementFactory::make("mp4mux")
-        .property("faststart", true)
-        .build()?;
+        let opusenc = gst::ElementFactory::make("opusenc")
+            .property("bitrate", AUDIO_BITRATE as i32)
+            .build()?;
 
-    // Audio filesink - write to temp directory
-    let audio_output_filename = format!("{}/audio.mp4", temp_path);
-    let audio_filesink = gst::ElementFactory::make("filesink")
-        .property("location", &audio_output_filename)
-        .build()?;
+        let audio_queue3 = gst::ElementFactory::make("queue").build()?;
+
+        // Audio qtmux for fragmented MP4 output
+        let audio_qtmux = gst::ElementFactory::make("mp4mux")
+            .property("faststart", true)
+            .build()?;
+
+        // Audio filesink - write to temp directory with language code
+        let audio_output_filename = format!("{}/audio_{}.mp4", temp_path, audio_stream.language);
+        let audio_filesink = gst::ElementFactory::make("filesink")
+            .property("location", &audio_output_filename)
+            .build()?;
+
+        audio_processors.push(AudioProcessor {
+            stream_index: audio_stream.stream_index,
+            language: audio_stream.language.clone(),
+            description: audio_stream.description.clone(),
+            subtitles: audio_stream.subtitles.clone(),
+            queue1: audio_queue1,
+            audioconvert,
+            audioresample,
+            queue2: audio_queue2,
+            opusenc,
+            queue3: audio_queue3,
+            qtmux: audio_qtmux,
+            filesink: audio_filesink,
+        });
+    }
 
     // Add base elements to pipeline
-    pipeline.add_many(&[
-        &filesrc,
-        &decodebin,
-        &tee,
-        &audio_queue1,
-        &audioconvert,
-        &audioresample,
-        &audio_queue2,
-        &opusenc,
-        &audio_queue3,
-        &audio_qtmux,
-        &audio_filesink,
-    ])?;
+    pipeline.add_many(&[&filesrc, &decodebin, &tee])?;
+
+    // Add audio processing elements to pipeline
+    for processor in &audio_processors {
+        pipeline.add_many(&[
+            &processor.queue1,
+            &processor.audioconvert,
+            &processor.audioresample,
+            &processor.queue2,
+            &processor.opusenc,
+            &processor.queue3,
+            &processor.qtmux,
+            &processor.filesink,
+        ])?;
+    }
 
     // Link static elements
     filesrc.link(&decodebin)?;
 
-    // Link audio processing chain
-    audio_queue1.link(&audioconvert)?;
-    audioconvert.link(&audioresample)?;
-    audioresample.link(&audio_queue2)?;
+    // Link audio processing chains
+    for processor in &audio_processors {
+        processor.queue1.link(&processor.audioconvert)?;
+        processor.audioconvert.link(&processor.audioresample)?;
+        processor.audioresample.link(&processor.queue2)?;
 
-    // Link audio with caps filter to ensure stereo
-    let audio_caps = gst::Caps::builder("audio/x-raw")
-        .field("channels", 2i32)
-        .build();
-    audio_queue2.link_filtered(&opusenc, &audio_caps)?;
-    opusenc.link(&audio_queue3)?;
-    audio_queue3.link(&audio_qtmux)?;
-    audio_qtmux.link(&audio_filesink)?;
+        // Link audio with caps filter to ensure stereo
+        let audio_caps = gst::Caps::builder("audio/x-raw")
+            .field("channels", 2i32)
+            .build();
+        processor
+            .queue2
+            .link_filtered(&processor.opusenc, &audio_caps)?;
+        processor.opusenc.link(&processor.queue3)?;
+        processor.queue3.link(&processor.qtmux)?;
+        processor.qtmux.link(&processor.filesink)?;
+    }
 
     // Create and link encoding branches - write to temp directory
     // We'll use the detected frame rate for keyframe interval
@@ -476,17 +588,24 @@ fn main() -> Result<()> {
 
     // Handle dynamic pads from decodebin
     let tee_weak = tee.downgrade();
-    let audio_queue1_weak = audio_queue1.downgrade();
     let detected_fps_weak = std::sync::Arc::downgrade(&detected_fps_clone);
+
+    // Create weak references for all audio processors
+    let audio_processors_weak: Vec<_> = audio_processors
+        .iter()
+        .map(|p| (std::sync::Arc::new(p.queue1.clone()), p.stream_index))
+        .collect();
+
+    // Get video stream index from config or default to 0
+    let video_stream_index = if let Some(config) = &config {
+        config.input.video_stream_index
+    } else {
+        0
+    };
 
     decodebin.connect_pad_added(move |_dbin, src_pad| {
         let tee = match tee_weak.upgrade() {
             Some(t) => t,
-            None => return,
-        };
-
-        let audio_queue1 = match audio_queue1_weak.upgrade() {
-            Some(q) => q,
             None => return,
         };
 
@@ -496,34 +615,66 @@ fn main() -> Result<()> {
         let name = structure.name();
 
         if name.starts_with("video/") {
-            // Detect frame rate from video caps
-            if let Some(fps_weak) = detected_fps_weak.upgrade() {
-                if let Ok(fps_value) = structure.get::<gst::Fraction>("framerate") {
-                    let fps_num = fps_value.numer() as u32;
-                    let fps_den = fps_value.denom() as u32;
-                    let actual_fps = if fps_den > 0 { fps_num / fps_den } else { 30 };
+            // Check if this is the selected video stream
+            let stream_id = src_pad.stream_id().unwrap_or_default();
+            let is_selected_video_stream = if video_stream_index == 0 {
+                // If video_stream_index is 0, use the first video stream
+                true
+            } else {
+                // Try to parse stream index from stream_id
+                stream_id.contains(&format!("video:{}", video_stream_index))
+            };
 
-                    // Update detected frame rate
-                    if let Ok(mut fps_guard) = fps_weak.lock() {
-                        *fps_guard = actual_fps;
+            if is_selected_video_stream {
+                // Detect frame rate from video caps
+                if let Some(fps_weak) = detected_fps_weak.upgrade() {
+                    if let Ok(fps_value) = structure.get::<gst::Fraction>("framerate") {
+                        let fps_num = fps_value.numer() as u32;
+                        let fps_den = fps_value.denom() as u32;
+                        let actual_fps = if fps_den > 0 { fps_num / fps_den } else { 30 };
+
+                        // Update detected frame rate
+                        if let Ok(mut fps_guard) = fps_weak.lock() {
+                            *fps_guard = actual_fps;
+                        }
+
+                        println!("Detected frame rate: {} fps", actual_fps);
                     }
+                }
 
-                    println!("Detected frame rate: {} fps", actual_fps);
+                let sink_pad = tee.static_pad("sink").unwrap();
+                if !sink_pad.is_linked() {
+                    src_pad
+                        .link(&sink_pad)
+                        .expect("Failed to link decodebin video to tee");
                 }
             }
-
-            let sink_pad = tee.static_pad("sink").unwrap();
-            if !sink_pad.is_linked() {
-                src_pad
-                    .link(&sink_pad)
-                    .expect("Failed to link decodebin video to tee");
-            }
         } else if name.starts_with("audio/") {
-            let sink_pad = audio_queue1.static_pad("sink").unwrap();
-            if !sink_pad.is_linked() {
-                src_pad
-                    .link(&sink_pad)
-                    .expect("Failed to link decodebin audio to queue");
+            // Find the matching audio processor for this stream
+            let stream_id = src_pad.stream_id().unwrap_or_default();
+
+            for (audio_queue_arc, expected_stream_index) in &audio_processors_weak {
+                let audio_queue = audio_queue_arc.clone();
+                let audio_queue = audio_queue.as_ref();
+
+                // Check if this stream matches any of our expected audio streams
+                let is_matching_stream = if *expected_stream_index == 0 {
+                    // If stream_index is 0, use the first audio stream
+                    true
+                } else {
+                    // Try to parse stream index from stream_id
+                    stream_id.contains(&format!("audio:{}", expected_stream_index))
+                };
+
+                if is_matching_stream {
+                    let sink_pad = audio_queue.static_pad("sink").unwrap();
+                    if !sink_pad.is_linked() {
+                        src_pad
+                            .link(&sink_pad)
+                            .expect("Failed to link decodebin audio to queue");
+                        break;
+                    }
+                }
             }
         }
     });
@@ -548,11 +699,15 @@ fn main() -> Result<()> {
                 for (resolution, _) in &quality_ladder {
                     println!("  - {}/video_{}p.mp4", temp_path, resolution);
                 }
-                println!("  - {}/audio.mp4", temp_path);
+                for processor in &audio_processors {
+                    println!("  - {}/audio_{}.mp4", temp_path, processor.language);
+                }
 
                 // Call packager to generate DASH manifest
                 println!("Generating DASH manifest...");
-                if let Err(e) = call_packager(&quality_ladder, temp_path, &output_dir) {
+                if let Err(e) =
+                    call_packager(&quality_ladder, &audio_processors, temp_path, &output_dir)
+                {
                     eprintln!("Failed to generate DASH manifest: {}", e);
                     eprintln!("Temporary directory preserved for debugging: {}", temp_path);
                 } else {
