@@ -501,7 +501,7 @@ fn main() -> Result<()> {
     use std::collections::HashMap;
     let mut language_counts: HashMap<String, usize> = HashMap::new();
 
-    for audio_stream in audio_streams {
+    for audio_stream in &audio_streams {
         // Count occurrences of each language
         let count = language_counts
             .entry(audio_stream.language.clone())
@@ -627,6 +627,10 @@ fn main() -> Result<()> {
         branches.push(branch);
     }
 
+    // Track pad creation success
+    let pads_successfully_linked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pads_successfully_linked_weak = std::sync::Arc::downgrade(&pads_successfully_linked);
+
     // Handle dynamic pads from decodebin
     let tee_weak = tee.downgrade();
     let detected_fps_weak = std::sync::Arc::downgrade(&detected_fps_clone);
@@ -645,6 +649,10 @@ fn main() -> Result<()> {
     };
 
     decodebin.connect_pad_added(move |_dbin, src_pad| {
+        let pads_successfully_linked = match pads_successfully_linked_weak.upgrade() {
+            Some(p) => p,
+            None => return,
+        };
         let tee = match tee_weak.upgrade() {
             Some(t) => t,
             None => return,
@@ -685,9 +693,15 @@ fn main() -> Result<()> {
 
                 let sink_pad = tee.static_pad("sink").unwrap();
                 if !sink_pad.is_linked() {
-                    src_pad
-                        .link(&sink_pad)
-                        .expect("Failed to link decodebin video to tee");
+                    if let Err(e) = src_pad.link(&sink_pad) {
+                        eprintln!("Failed to link decodebin video to tee: {}", e);
+                        return;
+                    }
+
+                    // Track successful video pad linking
+                    if let Ok(mut pads_guard) = pads_successfully_linked.lock() {
+                        pads_guard.push("video".to_string());
+                    }
                 }
             }
         } else if name.starts_with("audio/") {
@@ -710,13 +724,102 @@ fn main() -> Result<()> {
                 if is_matching_stream {
                     let sink_pad = audio_queue.static_pad("sink").unwrap();
                     if !sink_pad.is_linked() {
-                        src_pad
-                            .link(&sink_pad)
-                            .expect("Failed to link decodebin audio to queue");
+                        if let Err(e) = src_pad.link(&sink_pad) {
+                            eprintln!("Failed to link decodebin audio to queue: {}", e);
+                            continue;
+                        }
+
+                        // Track successful audio pad linking
+                        if let Ok(mut pads_guard) = pads_successfully_linked.lock() {
+                            pads_guard.push(format!("audio_{}", expected_stream_index));
+                        }
                         break;
                     }
                 }
             }
+        }
+    });
+
+    // Add "no-more-pads" signal handler for deterministic error detection
+    let pipeline_weak = pipeline.downgrade();
+    let pads_successfully_linked_weak_for_nomore =
+        std::sync::Arc::downgrade(&pads_successfully_linked);
+    let expected_audio_streams: Vec<usize> = audio_streams.iter().map(|s| s.stream_index).collect();
+    let video_stream_index_for_nomore = video_stream_index;
+
+    decodebin.connect_no_more_pads(move |_dbin| {
+        let pipeline = match pipeline_weak.upgrade() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let pads_successfully_linked = match pads_successfully_linked_weak_for_nomore.upgrade() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let successfully_linked = pads_successfully_linked.lock().unwrap();
+
+        // Check if we got the expected video pad
+        let has_video = successfully_linked.contains(&"video".to_string());
+
+        // Check if we got the expected audio pads
+        let mut missing_audio_streams = Vec::new();
+        for expected_stream_index in &expected_audio_streams {
+            let audio_key = format!("audio_{}", expected_stream_index);
+            if !successfully_linked.contains(&audio_key) {
+                missing_audio_streams.push(*expected_stream_index);
+            }
+        }
+
+        // If we're missing expected pads, post an error message
+        if video_stream_index_for_nomore == 0 && !has_video {
+            // Video stream 0 was expected but not found
+            let error_msg = "Failed to decode video stream";
+
+            let error_message = gst::ErrorMessage::new(
+                &gst::ResourceError::Failed,
+                Some(error_msg),
+                None,
+                file!(),
+                "decodebin_no_more_pads_handler",
+                line!(),
+            );
+            pipeline.post_error_message(error_message);
+        } else if video_stream_index_for_nomore > 0 && !has_video {
+            // Specific video stream was expected but not found
+            let error_msg = format!(
+                "Failed to decode video stream {}. The stream may not exist in the input file or the required decoder is missing.",
+                video_stream_index_for_nomore
+            );
+
+            let error_message = gst::ErrorMessage::new(
+                &gst::ResourceError::Failed,
+                Some(&error_msg),
+                None,
+                file!(),
+                "decodebin_no_more_pads_handler",
+                line!(),
+            );
+            pipeline.post_error_message(error_message);
+        }
+
+        if !missing_audio_streams.is_empty() {
+            let missing_list = missing_audio_streams.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+            let error_msg = format!(
+                "Failed to decode audio streams: {}. This typically indicates that the required audio decoder is not installed.",
+                missing_list
+            );
+
+            let error_message = gst::ErrorMessage::new(
+                &gst::ResourceError::Failed,
+                Some(&error_msg),
+                None,
+                file!(),
+                "decodebin_no_more_pads_handler",
+                line!(),
+            );
+            pipeline.post_error_message(error_message);
         }
     });
 
