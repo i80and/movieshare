@@ -72,11 +72,11 @@ struct Args {
     /// Encoder to use for AV1 encoding
     /// Options: vaapi (vaav1enc) or svtav1 (svtav1enc)
     /// Default: vaapi
-    #[arg(long, default_value = "vaapi")]
+    #[arg(long, default_value = "svtav1")]
     encoder: String,
 
     /// Preset for SVT-AV1 encoder (only used when encoder is svtav1)
-    /// Common presets: 0-13 (0=fastest, 13=best quality)
+    /// Common presets: 0-13 (0=best quality, 13=fastest)
     #[arg(long, requires = "encoder")]
     svtav1_preset: Option<u32>,
 }
