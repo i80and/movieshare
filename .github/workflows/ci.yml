@@ -19,7 +19,7 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0
+        sudo apt-get install -y libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad ffmpeg
 
     - name: Setup Deno
       uses: denoland/setup-deno@v2
@@ -29,6 +29,12 @@ jobs:
 
     - name: Run Deno linter
       run: cd webapp && deno install && deno check
-        
+
     - name: Check Rust
       run: cd preparer && cargo check --verbose
+
+    - name: Check Rust formatting
+      run: cd preparer && cargo fmt --check
+
+    - name: Run Rust tests
+      run: cd preparer && cargo test --verbose
