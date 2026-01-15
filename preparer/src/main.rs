@@ -263,9 +263,8 @@ impl EncodingBranch {
                 encoder.set_property("bitrate", bitrate_kbps);
 
                 // Disable natural keyframes to avoid conflicts with our time-based insertion
-                // Use a very large keyframe interval so the encoder doesn't insert natural keyframes
-                encoder.set_property("key-int-max", 9999); // Very large interval
-                encoder.set_property("key-int-min", 9999); // Very large interval
+                // Use the maximum allowed keyframe interval (1024) to minimize natural keyframes
+                encoder.set_property("key-int-max", 1024u32); // Maximum allowed value
 
                 encoder
             }
