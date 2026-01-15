@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing::{debug, error, info, warn};
 
-mod quality_ladder;
-use quality_ladder::parse_quality_ladder;
+pub mod quality_ladder;
 
 /// Configuration structure for TOML input
 #[derive(Debug, Serialize, Deserialize)]
@@ -223,7 +222,6 @@ struct EncodingBranch {
     scaler: gst::Element,
     capsfilter: gst::Element,
     queue2: gst::Element,
-    keyframe_inserter: KeyframeInserter,
     encoder: gst::Element,
     queue3: gst::Element,
     parser: gst::Element,
@@ -236,7 +234,6 @@ impl EncodingBranch {
     fn new(
         resolution: u32,
         bitrate_kbps: u32,
-        segment_duration_sec: u32,
         encoder_config: &EncoderConfig,
         output_dir: &str,
     ) -> Result<Self> {
@@ -248,9 +245,6 @@ impl EncodingBranch {
         let caps = gst::Caps::builder("video/x-raw")
             .field("height", gst::IntRange::new(1, target_height))
             .build();
-
-        // Create keyframe inserter for time-based keyframe insertion
-        let keyframe_inserter = KeyframeInserter::new(segment_duration_sec)?;
 
         // Create encoder based on configuration
         let encoder = match encoder_config.choice {
@@ -314,7 +308,6 @@ impl EncodingBranch {
                 .property("caps", &caps)
                 .build()?,
             queue2: gst::ElementFactory::make("queue").build()?,
-            keyframe_inserter,
             encoder,
             queue3: gst::ElementFactory::make("queue").build()?,
             parser: gst::ElementFactory::make("av1parse").build()?,
@@ -330,7 +323,6 @@ impl EncodingBranch {
             &self.scaler,
             &self.capsfilter,
             &self.queue2,
-            &self.keyframe_inserter.identity,
             &self.encoder,
             &self.queue3,
             &self.parser,
@@ -350,15 +342,8 @@ impl EncodingBranch {
         self.scaler.link(&self.capsfilter)?;
         self.capsfilter.link(&self.queue2)?;
 
-        // Add keyframe inserter after queue2
-        self.queue2.link(&self.keyframe_inserter.identity)?;
-
-        // Setup event probe on the inserter's sink pad for time-based keyframe insertion
-        let sink_pad = self.keyframe_inserter.identity.static_pad("sink").unwrap();
-        self.keyframe_inserter.setup_event_probe(&sink_pad)?;
-
         // Continue with encoder
-        self.keyframe_inserter.identity.link(&self.encoder)?;
+        self.queue2.link(&self.encoder)?;
         self.encoder.link(&self.queue3)?;
         self.queue3.link(&self.parser)?;
 
@@ -561,7 +546,7 @@ pub fn run_transcoding(
     info!("Using temporary directory: {}", temp_path);
 
     // Parse quality ladder
-    let quality_ladder = parse_quality_ladder(quality_ladder)?;
+    let quality_ladder = quality_ladder::parse_quality_ladder(quality_ladder)?;
     info!("Using quality ladder: {:?}", quality_ladder);
 
     // Parse encoder configuration
@@ -599,6 +584,9 @@ pub fn run_transcoding(
                 .build(),
         )
         .build()?;
+
+    // Create centralized keyframe inserter for time-based keyframe insertion
+    let keyframe_inserter = KeyframeInserter::new(target_duration)?;
 
     let tee = gst::ElementFactory::make("tee").name("t").build()?;
 
@@ -685,7 +673,14 @@ pub fn run_transcoding(
     }
 
     // Add base elements to pipeline
-    pipeline.add_many([&filesrc, &decodebin, &videoconvert, &capsfilter_main, &tee])?;
+    pipeline.add_many([
+        &filesrc,
+        &decodebin,
+        &videoconvert,
+        &capsfilter_main,
+        &keyframe_inserter.identity,
+        &tee,
+    ])?;
 
     // Add audio processing elements to pipeline
     for processor in &audio_processors {
@@ -732,13 +727,7 @@ pub fn run_transcoding(
     );
 
     for &(resolution, bitrate_kbps) in &quality_ladder {
-        let branch = EncodingBranch::new(
-            resolution,
-            bitrate_kbps,
-            target_duration,
-            &encoder_config,
-            temp_path,
-        )?;
+        let branch = EncodingBranch::new(resolution, bitrate_kbps, &encoder_config, temp_path)?;
         branch.add_to_pipeline(&pipeline)?;
         branch.link(&tee)?;
         branches.push(branch);
@@ -800,14 +789,26 @@ pub fn run_transcoding(
                         return;
                     }
 
-                    // Link videoconvert to capsfilter to tee
+                    // Link videoconvert to capsfilter to keyframe_inserter to tee
                     if let Err(e) = videoconvert.link(&capsfilter_main) {
                         error!("Failed to link videoconvert to capsfilter: {}", e);
                         return;
                     }
 
-                    if let Err(e) = capsfilter_main.link(&tee) {
-                        error!("Failed to link capsfilter to tee: {}", e);
+                    if let Err(e) = capsfilter_main.link(&keyframe_inserter.identity) {
+                        error!("Failed to link capsfilter to keyframe_inserter: {}", e);
+                        return;
+                    }
+
+                    // Setup event probe on the centralized keyframe inserter's sink pad
+                    let sink_pad = keyframe_inserter.identity.static_pad("sink").unwrap();
+                    if let Err(e) = keyframe_inserter.setup_event_probe(&sink_pad) {
+                        error!("Failed to setup event probe on keyframe_inserter: {}", e);
+                        return;
+                    }
+
+                    if let Err(e) = keyframe_inserter.identity.link(&tee) {
+                        error!("Failed to link keyframe_inserter to tee: {}", e);
                         return;
                     }
 
