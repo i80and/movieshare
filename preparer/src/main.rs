@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
 
@@ -7,14 +9,14 @@ use clap::Parser;
 struct Args {
     /// TOML configuration file for input streams
     #[arg(long)]
-    config: Option<String>,
+    config: Option<PathBuf>,
 
     /// Input file path (required if no config file)
     #[arg(long = "input-file")]
-    input_file: Option<String>,
+    input_file: Option<PathBuf>,
 
     /// Output directory
-    output_directory: String,
+    output_directory: PathBuf,
 
     /// Quality ladder in format: resolution@bitrate:resolution@bitrate (e.g., 1080@6000:480@1500)
     /// Default: 1080@6000

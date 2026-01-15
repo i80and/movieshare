@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -13,9 +13,9 @@ fn test_end_to_end_transcoding() -> Result<()> {
     use preparer::run_transcoding;
 
     run_transcoding(
-        Some("tests/data/big-buck-bunny.toml"),
+        Some(&PathBuf::from("tests/data/big-buck-bunny.toml")),
         None,
-        test_path.to_str().unwrap(),
+        &test_path,
         "1080@6000:480@1500",
         "svtav1",
         Some(13),

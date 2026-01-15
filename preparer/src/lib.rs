@@ -3,7 +3,11 @@ use clap::Parser;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 use tempfile::TempDir;
 use tracing::{debug, error, info, warn};
 
@@ -34,9 +38,9 @@ const SEGMENT_DURATION_SEC: u32 = 4; // Duration of each segment in seconds
 const AUDIO_BITRATE: u32 = 192000; // Bitrate for audio in bits per second
 
 /// Load configuration from TOML file
-fn load_config(config_path: &str) -> Result<(Config, String)> {
+fn load_config(config_path: &Path) -> Result<(Config, String)> {
     let config_content = std::fs::read_to_string(config_path)
-        .context(format!("Failed to read config file: {}", config_path))?;
+        .context(format!("Failed to read config file: {:?}", config_path))?;
 
     let config = toml::from_str(&config_content).context("Failed to parse TOML configuration")?;
 
@@ -60,10 +64,10 @@ struct Args {
 
     /// Input file path (required if no config file)
     #[arg(long = "input-file")]
-    input_file: Option<String>,
+    input_file: Option<PathBuf>,
 
     /// Output directory
-    output_directory: String,
+    output_directory: PathBuf,
 
     /// Quality ladder in format: resolution@bitrate:resolution@bitrate (e.g., 1080@6000:480@1500)
     /// Default: 1080@6000
@@ -372,8 +376,8 @@ impl EncodingBranch {
 fn call_packager(
     quality_ladder: &[(u32, u32)],
     audio_processors: &[AudioProcessor],
-    temp_dir: &str,
-    output_dir: &str,
+    temp_dir: &Path,
+    output_dir: &Path,
 ) -> Result<()> {
     let packager_path = "./packager-linux-x64";
 
@@ -383,26 +387,36 @@ fn call_packager(
     // Add video streams - read from temp_dir, write to output_dir
     for &(resolution, bitrate_kbps) in quality_ladder {
         let bandwidth = bitrate_kbps * 1000; // Convert kbps to bps
-        let video_input_file = format!("{}/video_{}p.mp4", temp_dir, resolution);
-        let video_output_file = format!("{}/video_{}p.mp4", output_dir, resolution);
-        command.arg(format!(
-            "in={},stream=video,output={},bandwidth={}",
-            video_input_file, video_output_file, bandwidth
-        ));
+        let video_filename = format!("video_{}p.mp4", resolution);
+        let video_input_file = temp_dir.join(&video_filename);
+        let video_output_file = output_dir.join(&video_filename);
+
+        let mut command_argument = OsString::from("in=");
+        command_argument.push(&video_input_file);
+        command_argument.push(",stream=video,output=");
+        command_argument.push(&video_output_file);
+        command_argument.push(format!(",bandwidth={}", bandwidth));
+        command.arg(&command_argument);
     }
 
     // Add audio streams - read from temp_dir, write to output_dir
     for audio_processor in audio_processors {
-        let audio_input_file = format!("{}/audio_{}.mp4", temp_dir, audio_processor.language);
-        let audio_output_file = format!("{}/audio_{}.mp4", output_dir, audio_processor.language);
-        command.arg(format!(
-            "in={},stream=audio,output={},language={},bandwidth={}",
-            audio_input_file, audio_output_file, audio_processor.language, AUDIO_BITRATE
+        let audio_filename = format!("audio_{}.mp4", audio_processor.language);
+        let audio_input_file = temp_dir.join(&audio_filename);
+        let audio_output_file = output_dir.join(&audio_filename);
+        let mut command_argument = OsString::from("in=");
+        command_argument.push(&audio_input_file);
+        command_argument.push(",stream=audio,output=");
+        command_argument.push(&audio_output_file);
+        command_argument.push(format!(
+            ",language={},bandwidth={}",
+            audio_processor.language, AUDIO_BITRATE
         ));
+        command.arg(&command_argument);
     }
 
     // Add manifest output and segment duration - write to output_dir
-    let manifest_file = format!("{}/manifest.mpd", output_dir);
+    let manifest_file = output_dir.join("manifest.mpd");
     command.arg("--mpd_output").arg(manifest_file);
     command
         .arg("--segment_duration")
@@ -413,7 +427,7 @@ fn call_packager(
 
     if !status.success() {
         anyhow::bail!(
-            "Packager failed with exit code: {:?}. Intermediate files are available in: {}",
+            "Packager failed with exit code: {:?}. Intermediate files are available in: {:?}",
             status.code(),
             temp_dir
         );
@@ -497,9 +511,9 @@ mod tests {
 
 /// Core transcoding function runner
 pub fn run_transcoding(
-    config_path: Option<&str>,
-    input_file: Option<&str>,
-    output_directory: &str,
+    config_path: Option<&Path>,
+    input_file: Option<&Path>,
+    output_directory: &Path,
     quality_ladder: &str,
     encoder: &str,
     svtav1_preset: Option<u32>,
@@ -522,22 +536,23 @@ pub fn run_transcoding(
             .context("Config directory should be available when config is loaded")?;
         // Resolve input path relative to config file directory
         let input_path = std::path::Path::new(config_dir).join(&config.input.path);
-        input_path.to_string_lossy().into_owned()
+        input_path.to_owned()
     } else if let Some(input_file) = input_file {
-        input_file.to_string()
+        input_file.to_owned()
     } else {
         anyhow::bail!("Either --config or --input-file must be provided");
     };
 
-    let output_dir = output_directory.to_string();
-
     // Ensure output directory exists
-    std::fs::create_dir_all(&output_dir)
-        .context(format!("Failed to create output directory: {}", output_dir))?;
+    std::fs::create_dir_all(output_directory).context(format!(
+        "Failed to create output directory: {:?}",
+        output_directory
+    ))?;
 
     // Create temporary directory inside the output directory
     // This ensures we have enough space and avoids cross-filesystem issues
-    let temp_dir = TempDir::new_in(&output_dir).context("Failed to create temporary directory")?;
+    let temp_dir =
+        TempDir::new_in(output_directory).context("Failed to create temporary directory")?;
     let temp_path = temp_dir
         .path()
         .to_str()
@@ -593,18 +608,8 @@ pub fn run_transcoding(
     // Audio processing elements - we'll create these for each audio stream
     let mut audio_processors = Vec::new();
 
-    // Get audio streams from config or use default
-    let audio_streams: Vec<AudioStreamConfig> = if let Some(config) = &config {
-        config.audio_streams.clone()
-    } else {
-        // Default to single English audio stream with index 0
-        vec![AudioStreamConfig {
-            stream_index: 0,
-            language: "en".to_string(),
-            description: "English Audio".to_string(),
-            subtitles: vec![0],
-        }]
-    };
+    // Get audio streams configuration
+    let audio_streams = get_audio_streams(&config);
 
     // Create audio processing pipelines for each stream
     // Track language usage to handle duplicates
@@ -939,8 +944,8 @@ pub fn run_transcoding(
 
     // Start playing
     info!("Starting fMP4 generation...");
-    info!("Input: {}", input_file);
-    info!("Output directory: {}", output_dir);
+    info!("Input: {:?}", input_file);
+    info!("Output directory: {:?}", output_directory);
     info!("Generating fragmented MP4 files suitable for DASH streaming");
 
     pipeline.set_state(gst::State::Playing)?;
@@ -952,39 +957,7 @@ pub fn run_transcoding(
 
         match msg.view() {
             MessageView::Eos(..) => {
-                info!("fMP4 generation complete!");
-                info!("Generated intermediate files in temporary directory:");
-                for (resolution, _) in &quality_ladder {
-                    debug!("  - {}/video_{}p.mp4", temp_path, resolution);
-                }
-                for processor in &audio_processors {
-                    debug!("  - {}/audio_{}.mp4", temp_path, processor.language);
-                }
-
-                // Call packager to generate DASH manifest
-                info!("Generating DASH manifest...");
-                if let Err(e) =
-                    call_packager(&quality_ladder, &audio_processors, temp_path, &output_dir)
-                {
-                    error!("Failed to generate DASH manifest: {}", e);
-                    error!("Temporary directory preserved for debugging: {}", temp_path);
-                } else {
-                    info!("DASH manifest generation complete!");
-                    info!("Final output files in: {}", output_dir);
-
-                    // Store temp_path for cleanup message before consuming temp_dir
-                    let temp_path_for_cleanup = temp_path.to_string();
-
-                    // Clean up temporary directory
-                    if let Err(e) = temp_dir.close() {
-                        warn!("Failed to clean up temporary directory: {}", e);
-                        warn!("You may manually delete: {}", temp_path_for_cleanup);
-                    } else {
-                        info!("Temporary directory cleaned up successfully");
-                    }
-
-                    info!("Files are ready for DASH streaming");
-                }
+                info!("GStreamer pipeline completed successfully");
                 break;
             }
             MessageView::Error(err) => {
@@ -1011,5 +984,68 @@ pub fn run_transcoding(
     // Clean up
     pipeline.set_state(gst::State::Null)?;
 
+    // Finalize transcoding with packager call
+    finalize_transcoding(
+        &quality_ladder,
+        &audio_processors,
+        temp_dir,
+        output_directory,
+    )
+}
+
+/// Get audio streams configuration from config or use defaults
+fn get_audio_streams(config: &Option<Config>) -> Vec<AudioStreamConfig> {
+    if let Some(config) = config {
+        config.audio_streams.clone()
+    } else {
+        vec![AudioStreamConfig {
+            stream_index: 0,
+            language: "en".to_string(),
+            description: "English Audio".to_string(),
+            subtitles: vec![0],
+        }]
+    }
+}
+
+/// Handle the finalization phase after GStreamer processing completes
+/// This includes calling the packager and cleaning up temporary files
+fn finalize_transcoding(
+    quality_ladder: &[(u32, u32)],
+    audio_processors: &[AudioProcessor],
+    temp_dir: TempDir,
+    output_dir: &Path,
+) -> Result<()> {
+    info!("fMP4 generation complete!");
+    info!("Generated intermediate files in temporary directory:");
+    for (resolution, _) in quality_ladder {
+        debug!("  - {:?}/video_{}p.mp4", temp_dir, resolution);
+    }
+    for processor in audio_processors {
+        debug!("  - {:?}/audio_{}.mp4", temp_dir, processor.language);
+    }
+
+    // Call packager to generate DASH manifest
+    info!("Generating DASH manifest...");
+    call_packager(
+        quality_ladder,
+        audio_processors,
+        temp_dir.path(),
+        output_dir,
+    )
+    .with_context(|| "Error calling packager to generate DASH manifest")?;
+
+    info!("DASH manifest generation complete!");
+    info!("Final output files in: {:?}", output_dir);
+
+    // Clean up temporary directory
+    let temp_path_for_cleanup = temp_dir.path().as_os_str().to_owned();
+    if let Err(e) = temp_dir.close() {
+        warn!("Failed to clean up temporary directory: {}", e);
+        warn!("You may manually delete: {:?}", temp_path_for_cleanup);
+    } else {
+        info!("Temporary directory cleaned up successfully");
+    }
+
+    info!("Files are ready for DASH streaming");
     Ok(())
 }
