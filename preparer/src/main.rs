@@ -198,9 +198,6 @@ impl KeyframeInserter {
 
     fn send_force_key_unit_event(pad: &gst::Pad) -> Result<(), gst::FlowError> {
         // Create a downstream force-key-unit event using the proper Rust bindings
-        // This is much cleaner than using FFI directly
-
-        use gstreamer_video::prelude::*;
 
         // Use the high-level builder API from gstreamer-video
         let event = gstreamer_video::DownstreamForceKeyUnitEvent::builder()
@@ -223,7 +220,7 @@ impl KeyframeInserter {
 
 struct EncodingBranch {
     queue1: gst::Element,
-    vaapipostproc: gst::Element,
+    scaler: gst::Element,
     capsfilter: gst::Element,
     queue2: gst::Element,
     keyframe_inserter: KeyframeInserter,
@@ -250,6 +247,7 @@ impl EncodingBranch {
         // Capsfilter to limit height only, allowing GStreamer to preserve aspect ratio
         let caps = gst::Caps::builder("video/x-raw")
             .field("height", gst::IntRange::new(1, target_height))
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
             .build();
 
         // Create keyframe inserter for time-based keyframe insertion
@@ -302,9 +300,17 @@ impl EncodingBranch {
             .property("location", &output_filename)
             .build()?;
 
+        // Create software scaler with Lanczos method for high quality downscaling
+        let scaler = gst::ElementFactory::make("videoscale")
+            .build()
+            .context("videoscale not available. This is a required GStreamer element.")?;
+
+        // Configure Lanczos scaling for high quality downscaling
+        scaler.set_property_from_str("method", "lanczos");
+
         Ok(Self {
             queue1: gst::ElementFactory::make("queue").build()?,
-            vaapipostproc: gst::ElementFactory::make("vaapipostproc").build()?,
+            scaler,
             capsfilter: gst::ElementFactory::make("capsfilter")
                 .property("caps", &caps)
                 .build()?,
@@ -322,7 +328,7 @@ impl EncodingBranch {
     fn add_to_pipeline(&self, pipeline: &gst::Pipeline) -> Result<()> {
         pipeline.add_many([
             &self.queue1,
-            &self.vaapipostproc,
+            &self.scaler,
             &self.capsfilter,
             &self.queue2,
             &self.keyframe_inserter.identity,
@@ -340,9 +346,9 @@ impl EncodingBranch {
         // Link from tee
         tee.link(&self.queue1)?;
 
-        // Link the encoding chain with VA-API postprocessing
-        self.queue1.link(&self.vaapipostproc)?;
-        self.vaapipostproc.link(&self.capsfilter)?;
+        // Link the encoding chain with selected scaler
+        self.queue1.link(&self.scaler)?;
+        self.scaler.link(&self.capsfilter)?;
         self.capsfilter.link(&self.queue2)?;
 
         // Add keyframe inserter after queue2
@@ -579,6 +585,22 @@ fn main() -> Result<()> {
 
     let decodebin = gst::ElementFactory::make("decodebin").name("d").build()?;
 
+    // Video format converter for SVT-AV1 compatibility
+    let videoconvert = gst::ElementFactory::make("videoconvert")
+        .name("videoconvert")
+        .build()?;
+
+    // Caps filter to ensure compatible format for SVT-AV1
+    let capsfilter_main = gst::ElementFactory::make("capsfilter")
+        .name("capsfilter_main")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "I420")
+                .build(),
+        )
+        .build()?;
+
     let tee = gst::ElementFactory::make("tee").name("t").build()?;
 
     // Audio processing elements - we'll create these for each audio stream
@@ -664,7 +686,7 @@ fn main() -> Result<()> {
     }
 
     // Add base elements to pipeline
-    pipeline.add_many([&filesrc, &decodebin, &tee])?;
+    pipeline.add_many([&filesrc, &decodebin, &videoconvert, &capsfilter_main, &tee])?;
 
     // Add audio processing elements to pipeline
     for processor in &audio_processors {
@@ -772,10 +794,21 @@ fn main() -> Result<()> {
             if is_selected_video_stream {
                 // No longer need frame rate detection since we use time-based keyframe insertion
 
-                let sink_pad = tee.static_pad("sink").unwrap();
-                if !sink_pad.is_linked() {
-                    if let Err(e) = src_pad.link(&sink_pad) {
-                        error!("Failed to link decodebin video to tee: {}", e);
+                let videoconvert_sink_pad = videoconvert.static_pad("sink").unwrap();
+                if !videoconvert_sink_pad.is_linked() {
+                    if let Err(e) = src_pad.link(&videoconvert_sink_pad) {
+                        error!("Failed to link decodebin video to videoconvert: {}", e);
+                        return;
+                    }
+
+                    // Link videoconvert to capsfilter to tee
+                    if let Err(e) = videoconvert.link(&capsfilter_main) {
+                        error!("Failed to link videoconvert to capsfilter: {}", e);
+                        return;
+                    }
+
+                    if let Err(e) = capsfilter_main.link(&tee) {
+                        error!("Failed to link capsfilter to tee: {}", e);
                         return;
                     }
 
