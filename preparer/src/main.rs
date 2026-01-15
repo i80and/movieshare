@@ -280,6 +280,9 @@ impl EncodingBranch {
                 encoder.set_property("intra-period-length", 999999); // Very large interval (effectively disabled)
                 // Note: We rely solely on our force-key-unit events for keyframe placement
 
+                // Optimize for visual quality instead of the default PSNR
+                encoder.set_property("parameters-string", "tune=0");
+
                 // Set preset if provided
                 if let Some(preset) = encoder_config.svtav1_preset {
                     encoder.set_property("preset", preset);
