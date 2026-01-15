@@ -5,6 +5,7 @@ use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
+use tracing::{debug, error, info, warn};
 
 mod quality_ladder;
 use quality_ladder::parse_quality_ladder;
@@ -177,10 +178,10 @@ impl KeyframeInserter {
                         if elapsed >= segment_duration {
                             // Time to insert a keyframe
                             if Self::send_force_key_unit_event(&pad_clone).is_err() {
-                                eprintln!("Failed to send force-key-unit event");
+                                error!("Failed to send force-key-unit event");
                             } else {
                                 *last_time = Some(pts);
-                                println!("Inserted keyframe at {}", pts);
+                                debug!("Inserted keyframe at {}", pts);
                             }
                         }
                     } else {
@@ -502,6 +503,11 @@ mod tests {
 }
 
 fn main() -> Result<()> {
+    // Initialize tracing with environment filter
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     // Initialize GStreamer
     gst::init()?;
 
@@ -544,17 +550,17 @@ fn main() -> Result<()> {
         .to_str()
         .context("Failed to convert temp directory path to string")?;
 
-    println!("Using temporary directory: {}", temp_path);
+    info!("Using temporary directory: {}", temp_path);
 
     // Parse quality ladder
     let quality_ladder = parse_quality_ladder(&args.quality_ladder)?;
-    println!("Using quality ladder: {:?}", quality_ladder);
+    info!("Using quality ladder: {:?}", quality_ladder);
 
     // Parse encoder configuration
     let encoder_config = EncoderConfig::from_args(&args.encoder, args.svtav1_preset)?;
-    println!("Using encoder: {}", encoder_config.choice);
+    info!("Using encoder: {}", encoder_config.choice);
     if let Some(preset) = encoder_config.svtav1_preset {
-        println!("Using SVT-AV1 preset: {}", preset);
+        info!("Using SVT-AV1 preset: {}", preset);
     }
 
     let target_duration = SEGMENT_DURATION_SEC; // seconds
@@ -696,7 +702,7 @@ fn main() -> Result<()> {
     // We now use time-based keyframe insertion instead of frame-based
     let mut branches = Vec::new();
 
-    println!(
+    info!(
         "Using time-based keyframe insertion for {} second segments",
         target_duration
     );
@@ -766,7 +772,7 @@ fn main() -> Result<()> {
                 let sink_pad = tee.static_pad("sink").unwrap();
                 if !sink_pad.is_linked() {
                     if let Err(e) = src_pad.link(&sink_pad) {
-                        eprintln!("Failed to link decodebin video to tee: {}", e);
+                        error!("Failed to link decodebin video to tee: {}", e);
                         return;
                     }
 
@@ -797,7 +803,7 @@ fn main() -> Result<()> {
                     let sink_pad = audio_queue.static_pad("sink").unwrap();
                     if !sink_pad.is_linked() {
                         if let Err(e) = src_pad.link(&sink_pad) {
-                            eprintln!("Failed to link decodebin audio to queue: {}", e);
+                            error!("Failed to link decodebin audio to queue: {}", e);
                             continue;
                         }
 
@@ -896,10 +902,10 @@ fn main() -> Result<()> {
     });
 
     // Start playing
-    println!("Starting fMP4 generation...");
-    println!("Input: {}", input_file);
-    println!("Output directory: {}", output_dir);
-    println!("Generating fragmented MP4 files suitable for DASH streaming");
+    info!("Starting fMP4 generation...");
+    info!("Input: {}", input_file);
+    info!("Output directory: {}", output_dir);
+    info!("Generating fragmented MP4 files suitable for DASH streaming");
 
     pipeline.set_state(gst::State::Playing)?;
 
@@ -910,56 +916,57 @@ fn main() -> Result<()> {
 
         match msg.view() {
             MessageView::Eos(..) => {
-                println!("fMP4 generation complete!");
-                println!("Generated intermediate files in temporary directory:");
+                info!("fMP4 generation complete!");
+                info!("Generated intermediate files in temporary directory:");
                 for (resolution, _) in &quality_ladder {
-                    println!("  - {}/video_{}p.mp4", temp_path, resolution);
+                    debug!("  - {}/video_{}p.mp4", temp_path, resolution);
                 }
                 for processor in &audio_processors {
-                    println!("  - {}/audio_{}.mp4", temp_path, processor.language);
+                    debug!("  - {}/audio_{}.mp4", temp_path, processor.language);
                 }
 
                 // Call packager to generate DASH manifest
-                println!("Generating DASH manifest...");
+                info!("Generating DASH manifest...");
                 if let Err(e) =
                     call_packager(&quality_ladder, &audio_processors, temp_path, &output_dir)
                 {
-                    eprintln!("Failed to generate DASH manifest: {}", e);
-                    eprintln!("Temporary directory preserved for debugging: {}", temp_path);
+                    error!("Failed to generate DASH manifest: {}", e);
+                    error!("Temporary directory preserved for debugging: {}", temp_path);
                 } else {
-                    println!("DASH manifest generation complete!");
-                    println!("Final output files in: {}", output_dir);
+                    info!("DASH manifest generation complete!");
+                    info!("Final output files in: {}", output_dir);
 
                     // Store temp_path for cleanup message before consuming temp_dir
                     let temp_path_for_cleanup = temp_path.to_string();
 
                     // Clean up temporary directory
                     if let Err(e) = temp_dir.close() {
-                        eprintln!("Warning: Failed to clean up temporary directory: {}", e);
-                        eprintln!("You may manually delete: {}", temp_path_for_cleanup);
+                        warn!("Failed to clean up temporary directory: {}", e);
+                        warn!("You may manually delete: {}", temp_path_for_cleanup);
                     } else {
-                        println!("Temporary directory cleaned up successfully");
+                        info!("Temporary directory cleaned up successfully");
                     }
 
-                    println!("Files are ready for DASH streaming");
+                    info!("Files are ready for DASH streaming");
                 }
                 break;
             }
             MessageView::Error(err) => {
-                eprintln!(
+                error!(
                     "Error from {:?}: {} ({:?})",
                     err.src().map(|s| s.path_string()),
                     err.error(),
                     err.debug()
                 );
-                eprintln!("Temporary directory preserved for debugging: {}", temp_path);
+                error!("Temporary directory preserved for debugging: {}", temp_path);
                 break;
             }
             MessageView::StateChanged(state) => {
                 if msg.src().map(|s| s == &pipeline).unwrap_or(false)
-                    && state.current() == gst::State::Playing {
-                        println!("Pipeline is now playing...");
-                    }
+                    && state.current() == gst::State::Playing
+                {
+                    info!("Pipeline is now playing...");
+                }
             }
             _ => (),
         }
