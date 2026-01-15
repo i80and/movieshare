@@ -316,7 +316,7 @@ impl EncodingBranch {
     }
 
     fn add_to_pipeline(&self, pipeline: &gst::Pipeline) -> Result<()> {
-        pipeline.add_many(&[
+        pipeline.add_many([
             &self.queue1,
             &self.vaapipostproc,
             &self.capsfilter,
@@ -655,11 +655,11 @@ fn main() -> Result<()> {
     }
 
     // Add base elements to pipeline
-    pipeline.add_many(&[&filesrc, &decodebin, &tee])?;
+    pipeline.add_many([&filesrc, &decodebin, &tee])?;
 
     // Add audio processing elements to pipeline
     for processor in &audio_processors {
-        pipeline.add_many(&[
+        pipeline.add_many([
             &processor.queue1,
             &processor.audioconvert,
             &processor.audioresample,
@@ -956,11 +956,10 @@ fn main() -> Result<()> {
                 break;
             }
             MessageView::StateChanged(state) => {
-                if msg.src().map(|s| s == &pipeline).unwrap_or(false) {
-                    if state.current() == gst::State::Playing {
+                if msg.src().map(|s| s == &pipeline).unwrap_or(false)
+                    && state.current() == gst::State::Playing {
                         println!("Pipeline is now playing...");
                     }
-                }
             }
             _ => (),
         }
