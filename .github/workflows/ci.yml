@@ -19,7 +19,7 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libgstreamer-plugins-good1.0 libgstreamer-plugins-bad1.0 ffmpeg
+        sudo apt-get install -y libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad ffmpeg
 
     - name: Setup Deno
       uses: denoland/setup-deno@v2
