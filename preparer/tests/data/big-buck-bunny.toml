@@ -1,0 +1,9 @@
+[input]
+path="bbb_mid10s_svtav1.mkv"
+video_stream_index = 0
+
+[[audio_streams]]
+stream_index = 0
+language = "en"
+description = "English"
+subtitles = []
