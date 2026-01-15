@@ -3,6 +3,7 @@ use clap::Parser;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 mod quality_ladder;
@@ -138,11 +139,93 @@ impl EncoderConfig {
     }
 }
 
+/// Keyframe inserter that injects force-key-unit events at precise time intervals
+struct KeyframeInserter {
+    identity: gst::Element,
+    last_keyframe_time: Arc<Mutex<Option<gst::ClockTime>>>,
+    segment_duration: gst::ClockTime,
+}
+
+impl KeyframeInserter {
+    fn new(segment_duration_sec: u32) -> Result<Self> {
+        let identity = gst::ElementFactory::make("identity")
+            .name("keyframe_inserter")
+            .build()?;
+
+        let segment_duration = gst::ClockTime::from_seconds(segment_duration_sec as u64);
+
+        Ok(Self {
+            identity,
+            last_keyframe_time: Arc::new(Mutex::new(None)),
+            segment_duration,
+        })
+    }
+
+    fn setup_event_probe(&self, pad: &gst::Pad) -> Result<()> {
+        let last_keyframe_time = self.last_keyframe_time.clone();
+        let segment_duration = self.segment_duration;
+        let pad_clone = pad.clone();
+
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, probe_info| {
+            if let Some(buffer) = probe_info.buffer() {
+                let pts = buffer.pts();
+                if let Some(pts) = pts {
+                    // Check if we need to insert a keyframe
+                    let mut last_time = last_keyframe_time.lock().unwrap();
+                    if let Some(last_pts) = *last_time {
+                        let elapsed = pts - last_pts;
+                        if elapsed >= segment_duration {
+                            // Time to insert a keyframe
+                            if Self::send_force_key_unit_event(&pad_clone).is_err() {
+                                eprintln!("Failed to send force-key-unit event");
+                            } else {
+                                *last_time = Some(pts);
+                                println!("Inserted keyframe at {}", pts);
+                            }
+                        }
+                    } else {
+                        // First buffer - record the time
+                        *last_time = Some(pts);
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+
+        Ok(())
+    }
+
+    fn send_force_key_unit_event(pad: &gst::Pad) -> Result<(), gst::FlowError> {
+        // Create a downstream force-key-unit event using the proper Rust bindings
+        // This is much cleaner than using FFI directly
+
+        use gstreamer_video::prelude::*;
+
+        // Use the high-level builder API from gstreamer-video
+        let event = gstreamer_video::DownstreamForceKeyUnitEvent::builder()
+            .timestamp(gst::ClockTime::NONE) // Let GStreamer determine the timestamp
+            .stream_time(gst::ClockTime::NONE) // Let GStreamer determine the stream time
+            .running_time(gst::ClockTime::NONE) // Let GStreamer determine the running time
+            .all_headers(true) // Include all headers
+            .count(0) // Default count
+            .build();
+
+        // Send the event downstream
+        let success = pad.send_event(event);
+        if !success {
+            return Err(gst::FlowError::Error);
+        }
+
+        Ok(())
+    }
+}
+
 struct EncodingBranch {
     queue1: gst::Element,
     vaapipostproc: gst::Element,
     capsfilter: gst::Element,
     queue2: gst::Element,
+    keyframe_inserter: KeyframeInserter,
     encoder: gst::Element,
     queue3: gst::Element,
     parser: gst::Element,
@@ -155,7 +238,7 @@ impl EncodingBranch {
     fn new(
         resolution: u32,
         bitrate_kbps: u32,
-        keyframe_interval: u32,
+        segment_duration_sec: u32,
         encoder_config: &EncoderConfig,
         output_dir: &str,
     ) -> Result<Self> {
@@ -168,6 +251,9 @@ impl EncodingBranch {
             .field("height", gst::IntRange::new(1, target_height))
             .build();
 
+        // Create keyframe inserter for time-based keyframe insertion
+        let keyframe_inserter = KeyframeInserter::new(segment_duration_sec)?;
+
         // Create encoder based on configuration
         let encoder = match encoder_config.choice {
             EncoderChoice::Vaapi => {
@@ -176,8 +262,10 @@ impl EncodingBranch {
                     .with_context(|| "vaav1enc encoder not available. Make sure VA-API and AV1 encoding support are installed.")?;
                 encoder.set_property("bitrate", bitrate_kbps);
 
-                // Set keyframe interval for proper segment alignment
-                encoder.set_property("key-int-max", keyframe_interval as u32);
+                // Disable natural keyframes to avoid conflicts with our time-based insertion
+                // Use a very large keyframe interval so the encoder doesn't insert natural keyframes
+                encoder.set_property("key-int-max", 9999); // Very large interval
+                encoder.set_property("key-int-min", 9999); // Very large interval
 
                 encoder
             }
@@ -187,8 +275,10 @@ impl EncodingBranch {
                     .with_context(|| "svtav1enc encoder not available. Make sure SVT-AV1 encoder is installed.")?;
                 encoder.set_property("target-bitrate", bitrate_kbps);
 
-                // Set keyframe interval for proper segment alignment
-                encoder.set_property("intra-period-length", keyframe_interval as i32);
+                // Disable natural keyframes to avoid conflicts with our time-based insertion
+                // Use a very large intra-period to prevent the encoder from inserting natural keyframes
+                encoder.set_property("intra-period-length", 999999); // Very large interval (effectively disabled)
+                // Note: We rely solely on our force-key-unit events for keyframe placement
 
                 // Set preset if provided
                 if let Some(preset) = encoder_config.svtav1_preset {
@@ -216,6 +306,7 @@ impl EncodingBranch {
                 .property("caps", &caps)
                 .build()?,
             queue2: gst::ElementFactory::make("queue").build()?,
+            keyframe_inserter,
             encoder,
             queue3: gst::ElementFactory::make("queue").build()?,
             parser: gst::ElementFactory::make("av1parse").build()?,
@@ -231,6 +322,7 @@ impl EncodingBranch {
             &self.vaapipostproc,
             &self.capsfilter,
             &self.queue2,
+            &self.keyframe_inserter.identity,
             &self.encoder,
             &self.queue3,
             &self.parser,
@@ -249,7 +341,16 @@ impl EncodingBranch {
         self.queue1.link(&self.vaapipostproc)?;
         self.vaapipostproc.link(&self.capsfilter)?;
         self.capsfilter.link(&self.queue2)?;
-        self.queue2.link(&self.encoder)?;
+
+        // Add keyframe inserter after queue2
+        self.queue2.link(&self.keyframe_inserter.identity)?;
+
+        // Setup event probe on the inserter's sink pad for time-based keyframe insertion
+        let sink_pad = self.keyframe_inserter.identity.static_pad("sink").unwrap();
+        self.keyframe_inserter.setup_event_probe(&sink_pad)?;
+
+        // Continue with encoder
+        self.keyframe_inserter.identity.link(&self.encoder)?;
         self.encoder.link(&self.queue3)?;
         self.queue3.link(&self.parser)?;
 
@@ -459,14 +560,6 @@ fn main() -> Result<()> {
 
     let target_duration = SEGMENT_DURATION_SEC; // seconds
 
-    // Frame rate detection - we'll detect actual frame rate from source
-    // Start with a reasonable default, but this will be updated when we detect caps
-    let detected_fps = std::sync::Arc::new(std::sync::Mutex::new(30u32));
-    let detected_fps_clone = detected_fps.clone();
-
-    // Calculate initial keyframe interval (will be recalculated after frame rate detection)
-    let _keyframe_interval = std::sync::Arc::new(std::sync::Mutex::new(30 * target_duration));
-
     // Create the pipeline
     let pipeline = gst::Pipeline::new();
 
@@ -601,24 +694,19 @@ fn main() -> Result<()> {
     }
 
     // Create and link encoding branches - write to temp directory
-    // We'll use the detected frame rate for keyframe interval
+    // We now use time-based keyframe insertion instead of frame-based
     let mut branches = Vec::new();
-    let final_keyframe_interval = {
-        // Get the detected frame rate (or use default if not detected yet)
-        let detected_fps = *detected_fps.lock().unwrap();
-        detected_fps * target_duration
-    };
 
     println!(
-        "Using keyframe interval: {} frames (for {} second segments)",
-        final_keyframe_interval, target_duration
+        "Using time-based keyframe insertion for {} second segments",
+        target_duration
     );
 
     for &(resolution, bitrate_kbps) in &quality_ladder {
         let branch = EncodingBranch::new(
             resolution,
             bitrate_kbps,
-            final_keyframe_interval,
+            target_duration,
             &encoder_config,
             temp_path,
         )?;
@@ -633,7 +721,6 @@ fn main() -> Result<()> {
 
     // Handle dynamic pads from decodebin
     let tee_weak = tee.downgrade();
-    let detected_fps_weak = std::sync::Arc::downgrade(&detected_fps_clone);
 
     // Create weak references for all audio processors
     let audio_processors_weak: Vec<_> = audio_processors
@@ -675,21 +762,7 @@ fn main() -> Result<()> {
             };
 
             if is_selected_video_stream {
-                // Detect frame rate from video caps
-                if let Some(fps_weak) = detected_fps_weak.upgrade() {
-                    if let Ok(fps_value) = structure.get::<gst::Fraction>("framerate") {
-                        let fps_num = fps_value.numer() as u32;
-                        let fps_den = fps_value.denom() as u32;
-                        let actual_fps = if fps_den > 0 { fps_num / fps_den } else { 30 };
-
-                        // Update detected frame rate
-                        if let Ok(mut fps_guard) = fps_weak.lock() {
-                            *fps_guard = actual_fps;
-                        }
-
-                        println!("Detected frame rate: {} fps", actual_fps);
-                    }
-                }
+                // No longer need frame rate detection since we use time-based keyframe insertion
 
                 let sink_pad = tee.static_pad("sink").unwrap();
                 if !sink_pad.is_linked() {
