@@ -508,6 +508,49 @@ mod tests {
     }
 }
 
+/// Handle the finalization phase after GStreamer processing completes
+/// This includes calling the packager and cleaning up temporary files
+fn finalize_transcoding(
+    quality_ladder: &[(u32, u32)],
+    audio_processors: &[AudioProcessor],
+    temp_dir: TempDir,
+    output_dir: &path::Path,
+) -> Result<()> {
+    info!("fMP4 generation complete!");
+    info!("Generated intermediate files in temporary directory:");
+    for (resolution, _) in quality_ladder {
+        debug!("  - {:?}/video_{}p.mp4", temp_dir, resolution);
+    }
+    for processor in audio_processors {
+        debug!("  - {:?}/audio_{}.mp4", temp_dir, processor.language);
+    }
+
+    // Call packager to generate DASH manifest
+    info!("Generating DASH manifest...");
+    call_packager(
+        quality_ladder,
+        audio_processors,
+        temp_dir.path(),
+        output_dir,
+    )
+    .with_context(|| "Error calling packager to generate DASH manifest")?;
+
+    info!("DASH manifest generation complete!");
+    info!("Final output files in: {:?}", output_dir);
+
+    // Clean up temporary directory
+    let temp_path_for_cleanup = temp_dir.path().as_os_str().to_owned();
+    if let Err(e) = temp_dir.close() {
+        warn!("Failed to clean up temporary directory: {}", e);
+        warn!("You may manually delete: {:?}", temp_path_for_cleanup);
+    } else {
+        info!("Temporary directory cleaned up successfully");
+    }
+
+    info!("Files are ready for DASH streaming");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Initialize tracing with environment filter
     tracing_subscriber::fmt()
@@ -964,40 +1007,7 @@ fn main() -> Result<()> {
 
         match msg.view() {
             MessageView::Eos(..) => {
-                info!("fMP4 generation complete!");
-                info!("Generated intermediate files in temporary directory:");
-                for (resolution, _) in &quality_ladder {
-                    debug!("  - {:?}/video_{}p.mp4", temp_path, resolution);
-                }
-                for processor in &audio_processors {
-                    debug!("  - {:?}/audio_{}.mp4", temp_path, processor.language);
-                }
-
-                // Call packager to generate DASH manifest
-                info!("Generating DASH manifest...");
-                if let Err(e) =
-                    call_packager(&quality_ladder, &audio_processors, temp_path, &output_dir)
-                {
-                    error!("Failed to generate DASH manifest: {}", e);
-                    error!(
-                        "Temporary directory preserved for debugging: {:?}",
-                        temp_path
-                    );
-                } else {
-                    info!("DASH manifest generation complete!");
-                    info!("Final output files in: {:?}", output_dir);
-
-                    // Clean up temporary directory
-                    let temp_path_clone = temp_path.to_owned();
-                    if let Err(e) = temp_dir.close() {
-                        warn!("Failed to clean up temporary directory: {}", e);
-                        warn!("You may manually delete: {:?}", temp_path_clone);
-                    } else {
-                        info!("Temporary directory cleaned up successfully");
-                    }
-
-                    info!("Files are ready for DASH streaming");
-                }
+                info!("GStreamer pipeline completed successfully");
                 break;
             }
             MessageView::Error(err) => {
@@ -1027,5 +1037,6 @@ fn main() -> Result<()> {
     // Clean up
     pipeline.set_state(gst::State::Null)?;
 
-    Ok(())
+    // Finalize transcoding with packager call
+    finalize_transcoding(&quality_ladder, &audio_processors, temp_dir, &output_dir)
 }
