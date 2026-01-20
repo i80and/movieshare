@@ -3,6 +3,8 @@ use clap::Parser;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
+use std::path;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing::{debug, error, info, warn};
@@ -34,14 +36,14 @@ const SEGMENT_DURATION_SEC: u32 = 4; // Duration of each segment in seconds
 const AUDIO_BITRATE: u32 = 192000; // Bitrate for audio in bits per second
 
 /// Load configuration from TOML file
-fn load_config(config_path: &str) -> Result<(Config, String)> {
+fn load_config(config_path: &path::Path) -> Result<(Config, String)> {
     let config_content = std::fs::read_to_string(config_path)
-        .context(format!("Failed to read config file: {}", config_path))?;
+        .context(format!("Failed to read config file: {:?}", config_path))?;
 
     let config = toml::from_str(&config_content).context("Failed to parse TOML configuration")?;
 
     // Get the directory containing the config file
-    let config_dir = std::path::Path::new(config_path)
+    let config_dir = config_path
         .parent()
         .context("Failed to get parent directory of config file")?
         .to_string_lossy()
@@ -56,14 +58,14 @@ fn load_config(config_path: &str) -> Result<(Config, String)> {
 struct Args {
     /// TOML configuration file for input streams
     #[arg(long)]
-    config: Option<String>,
+    config: Option<path::PathBuf>,
 
     /// Input file path (required if no config file)
     #[arg(long = "input-file")]
-    input_file: Option<String>,
+    input_file: Option<path::PathBuf>,
 
     /// Output directory
-    output_directory: String,
+    output_directory: path::PathBuf,
 
     /// Quality ladder in format: resolution@bitrate:resolution@bitrate (e.g., 1080@6000:480@1500)
     /// Default: 1080@6000
@@ -235,7 +237,7 @@ impl EncodingBranch {
         resolution: u32,
         bitrate_kbps: u32,
         encoder_config: &EncoderConfig,
-        output_dir: &str,
+        output_dir: &path::Path,
     ) -> Result<Self> {
         // Treat resolution as target height and let GStreamer preserve aspect ratio
         // This allows automatic width determination based on the source aspect ratio
@@ -289,7 +291,7 @@ impl EncodingBranch {
             .build()?;
 
         // Create filesink with appropriate filename
-        let output_filename = format!("{}/video_{}p.mp4", output_dir, resolution);
+        let output_filename = output_dir.join(format!("video_{}p.mp4", resolution));
         let filesink = gst::ElementFactory::make("filesink")
             .property("location", &output_filename)
             .build()?;
@@ -373,8 +375,8 @@ impl EncodingBranch {
 fn call_packager(
     quality_ladder: &[(u32, u32)],
     audio_processors: &[AudioProcessor],
-    temp_dir: &str,
-    output_dir: &str,
+    temp_dir: &path::Path,
+    output_dir: &path::Path,
 ) -> Result<()> {
     let packager_path = "./packager-linux-x64";
 
@@ -384,26 +386,36 @@ fn call_packager(
     // Add video streams - read from temp_dir, write to output_dir
     for &(resolution, bitrate_kbps) in quality_ladder {
         let bandwidth = bitrate_kbps * 1000; // Convert kbps to bps
-        let video_input_file = format!("{}/video_{}p.mp4", temp_dir, resolution);
-        let video_output_file = format!("{}/video_{}p.mp4", output_dir, resolution);
-        command.arg(format!(
-            "in={},stream=video,output={},bandwidth={}",
-            video_input_file, video_output_file, bandwidth
-        ));
+        let video_filename = format!("video_{}p.mp4", resolution);
+        let video_input_file = temp_dir.join(&video_filename);
+        let video_output_file = output_dir.join(&video_filename);
+
+        let mut command_argument = OsString::from("in=");
+        command_argument.push(&video_input_file);
+        command_argument.push(",stream=video,output=");
+        command_argument.push(&video_output_file);
+        command_argument.push(format!(",bandwidth={}", bandwidth));
+        command.arg(&command_argument);
     }
 
     // Add audio streams - read from temp_dir, write to output_dir
     for audio_processor in audio_processors {
-        let audio_input_file = format!("{}/audio_{}.mp4", temp_dir, audio_processor.language);
-        let audio_output_file = format!("{}/audio_{}.mp4", output_dir, audio_processor.language);
-        command.arg(format!(
-            "in={},stream=audio,output={},language={},bandwidth={}",
-            audio_input_file, audio_output_file, audio_processor.language, AUDIO_BITRATE
+        let audio_filename = format!("audio_{}.mp4", audio_processor.language);
+        let audio_input_file = temp_dir.join(&audio_filename);
+        let audio_output_file = output_dir.join(&audio_filename);
+        let mut command_argument = OsString::from("in=");
+        command_argument.push(&audio_input_file);
+        command_argument.push(",stream=audio,output=");
+        command_argument.push(&audio_output_file);
+        command_argument.push(format!(
+            ",language={},bandwidth={}",
+            audio_processor.language, AUDIO_BITRATE
         ));
+        command.arg(&command_argument);
     }
 
     // Add manifest output and segment duration - write to output_dir
-    let manifest_file = format!("{}/manifest.mpd", output_dir);
+    let manifest_file = output_dir.join("manifest.mpd");
     command.arg("--mpd_output").arg(manifest_file);
     command
         .arg("--segment_duration")
@@ -414,7 +426,7 @@ fn call_packager(
 
     if !status.success() {
         anyhow::bail!(
-            "Packager failed with exit code: {:?}. Intermediate files are available in: {}",
+            "Packager failed with exit code: {:?}. Intermediate files are available in: {:?}",
             status.code(),
             temp_dir
         );
@@ -523,7 +535,7 @@ fn main() -> Result<()> {
             .context("Config directory should be available when config is loaded")?;
         // Resolve input path relative to config file directory
         let input_path = std::path::Path::new(config_dir).join(&config.input.path);
-        input_path.to_string_lossy().into_owned()
+        input_path.clone()
     } else if let Some(input_file) = args.input_file {
         input_file
     } else {
@@ -533,18 +545,17 @@ fn main() -> Result<()> {
     let output_dir = args.output_directory;
 
     // Ensure output directory exists
-    std::fs::create_dir_all(&output_dir)
-        .context(format!("Failed to create output directory: {}", output_dir))?;
+    std::fs::create_dir_all(&output_dir).context(format!(
+        "Failed to create output directory: {:?}",
+        output_dir
+    ))?;
 
     // Create temporary directory inside the output directory
     // This ensures we have enough space and avoids cross-filesystem issues
     let temp_dir = TempDir::new_in(&output_dir).context("Failed to create temporary directory")?;
-    let temp_path = temp_dir
-        .path()
-        .to_str()
-        .context("Failed to convert temp directory path to string")?;
+    let temp_path = temp_dir.path();
 
-    info!("Using temporary directory: {}", temp_path);
+    info!("Using temporary directory: {:?}", temp_path);
 
     // Parse quality ladder
     let quality_ladder = quality_ladder::parse_quality_ladder(&args.quality_ladder)?;
@@ -642,10 +653,10 @@ fn main() -> Result<()> {
         } else {
             String::new()
         };
-        let audio_output_filename = format!(
-            "{}/audio_{}{}.mp4",
-            temp_path, audio_stream.language, language_suffix
-        );
+        let audio_output_filename = temp_path.join(format!(
+            "audio_{}{}.mp4",
+            audio_stream.language, language_suffix
+        ));
         let audio_filesink = gst::ElementFactory::make("filesink")
             .property("location", &audio_output_filename)
             .build()?;
@@ -940,8 +951,8 @@ fn main() -> Result<()> {
 
     // Start playing
     info!("Starting fMP4 generation...");
-    info!("Input: {}", input_file);
-    info!("Output directory: {}", output_dir);
+    info!("Input: {:?}", input_file);
+    info!("Output directory: {:?}", output_dir);
     info!("Generating fragmented MP4 files suitable for DASH streaming");
 
     pipeline.set_state(gst::State::Playing)?;
@@ -956,10 +967,10 @@ fn main() -> Result<()> {
                 info!("fMP4 generation complete!");
                 info!("Generated intermediate files in temporary directory:");
                 for (resolution, _) in &quality_ladder {
-                    debug!("  - {}/video_{}p.mp4", temp_path, resolution);
+                    debug!("  - {:?}/video_{}p.mp4", temp_path, resolution);
                 }
                 for processor in &audio_processors {
-                    debug!("  - {}/audio_{}.mp4", temp_path, processor.language);
+                    debug!("  - {:?}/audio_{}.mp4", temp_path, processor.language);
                 }
 
                 // Call packager to generate DASH manifest
@@ -968,18 +979,19 @@ fn main() -> Result<()> {
                     call_packager(&quality_ladder, &audio_processors, temp_path, &output_dir)
                 {
                     error!("Failed to generate DASH manifest: {}", e);
-                    error!("Temporary directory preserved for debugging: {}", temp_path);
+                    error!(
+                        "Temporary directory preserved for debugging: {:?}",
+                        temp_path
+                    );
                 } else {
                     info!("DASH manifest generation complete!");
-                    info!("Final output files in: {}", output_dir);
-
-                    // Store temp_path for cleanup message before consuming temp_dir
-                    let temp_path_for_cleanup = temp_path.to_string();
+                    info!("Final output files in: {:?}", output_dir);
 
                     // Clean up temporary directory
+                    let temp_path_clone = temp_path.to_owned();
                     if let Err(e) = temp_dir.close() {
                         warn!("Failed to clean up temporary directory: {}", e);
-                        warn!("You may manually delete: {}", temp_path_for_cleanup);
+                        warn!("You may manually delete: {:?}", temp_path_clone);
                     } else {
                         info!("Temporary directory cleaned up successfully");
                     }
@@ -995,7 +1007,10 @@ fn main() -> Result<()> {
                     err.error(),
                     err.debug()
                 );
-                error!("Temporary directory preserved for debugging: {}", temp_path);
+                error!(
+                    "Temporary directory preserved for debugging: {:?}",
+                    temp_path
+                );
                 break;
             }
             MessageView::StateChanged(state) => {
