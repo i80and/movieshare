@@ -13,7 +13,9 @@ use anyhow::{Context, Result};
 /// # Examples
 ///
 /// ```
-/// let ladder = parse_quality_ladder("1080@6000:480@1500")?;
+/// use preparer::quality_ladder::parse_quality_ladder;
+///
+/// let ladder = parse_quality_ladder("1080@6000:480@1500").unwrap();
 /// assert_eq!(ladder, vec![(1080, 6000), (480, 1500)]);
 /// ```
 pub fn parse_quality_ladder(quality_ladder: &str) -> Result<Vec<(u32, u32)>> {
