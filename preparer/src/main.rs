@@ -3,12 +3,12 @@ use clap::Parser;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
 use std::path;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing::{debug, error, info, warn};
 
+mod packager;
 pub mod quality_ladder;
 
 /// Configuration structure for TOML input
@@ -286,12 +286,10 @@ impl EncodingBranch {
         };
 
         // Create qtmux for fragmented MP4 output
-        let qtmux = gst::ElementFactory::make("mp4mux")
-            .property("faststart", true)
-            .build()?;
+        let qtmux = gst::ElementFactory::make("webmmux").build()?;
 
         // Create filesink with appropriate filename
-        let output_filename = output_dir.join(format!("video_{}p.mp4", resolution));
+        let output_filename = output_dir.join(format!("video_{}p.webm", resolution));
         let filesink = gst::ElementFactory::make("filesink")
             .property("location", &output_filename)
             .build()?;
@@ -378,60 +376,26 @@ fn call_packager(
     temp_dir: &path::Path,
     output_dir: &path::Path,
 ) -> Result<()> {
-    let packager_path = "./packager-linux-x64";
-
-    // Build the packager command
-    let mut command = std::process::Command::new(packager_path);
+    let mut paths = vec![];
 
     // Add video streams - read from temp_dir, write to output_dir
     for &(resolution, bitrate_kbps) in quality_ladder {
-        let bandwidth = bitrate_kbps * 1000; // Convert kbps to bps
-        let video_filename = format!("video_{}p.mp4", resolution);
+        let _bandwidth = bitrate_kbps * 1000; // Convert kbps to bps
+        let video_filename = format!("video_{}p.webm", resolution);
         let video_input_file = temp_dir.join(&video_filename);
-        let video_output_file = output_dir.join(&video_filename);
-
-        let mut command_argument = OsString::from("in=");
-        command_argument.push(&video_input_file);
-        command_argument.push(",stream=video,output=");
-        command_argument.push(&video_output_file);
-        command_argument.push(format!(",bandwidth={}", bandwidth));
-        command.arg(&command_argument);
+        paths.push(video_input_file.to_owned());
     }
 
     // Add audio streams - read from temp_dir, write to output_dir
     for audio_processor in audio_processors {
-        let audio_filename = format!("audio_{}.mp4", audio_processor.language);
+        let audio_filename = format!("audio_{}.webm", audio_processor.language);
         let audio_input_file = temp_dir.join(&audio_filename);
-        let audio_output_file = output_dir.join(&audio_filename);
-        let mut command_argument = OsString::from("in=");
-        command_argument.push(&audio_input_file);
-        command_argument.push(",stream=audio,output=");
-        command_argument.push(&audio_output_file);
-        command_argument.push(format!(
-            ",language={},bandwidth={}",
-            audio_processor.language, AUDIO_BITRATE
-        ));
-        command.arg(&command_argument);
+        paths.push(audio_input_file.to_owned());
     }
 
-    // Add manifest output and segment duration - write to output_dir
-    let manifest_file = output_dir.join("manifest.mpd");
-    command.arg("--mpd_output").arg(manifest_file);
-    command
-        .arg("--segment_duration")
-        .arg(SEGMENT_DURATION_SEC.to_string());
-
-    // Execute the command
-    let status = command.status()?;
-
-    if !status.success() {
-        anyhow::bail!(
-            "Packager failed with exit code: {:?}. Intermediate files are available in: {:?}",
-            status.code(),
-            temp_dir
-        );
-    }
-
+    let info = packager::collect_dash_info(&paths)?;
+    let manifest_text = packager::generate_dash_manifest(&info, true)?;
+    std::fs::write(output_dir.join("manifest.mpd"), manifest_text)?;
     Ok(())
 }
 
@@ -450,17 +414,17 @@ mod tests {
 
         // Video streams - read from temp_dir, write to output_dir
         expected_args.push(
-            "in=test_temp/video_1080p.mp4,stream=video,output=test_output/video_1080p.mp4,bandwidth=3000000",
+            "in=test_temp/video_1080p.webm,stream=video,output=test_output/video_1080p.webm,bandwidth=3000000",
         );
         expected_args.push(
-            "in=test_temp/video_720p.mp4,stream=video,output=test_output/video_720p.mp4,bandwidth=1500000",
+            "in=test_temp/video_720p.webm,stream=video,output=test_output/video_720p.webm,bandwidth=1500000",
         );
         expected_args.push(
-            "in=test_temp/video_480p.mp4,stream=video,output=test_output/video_480p.mp4,bandwidth=800000",
+            "in=test_temp/video_480p.webm,stream=video,output=test_output/video_480p.webm,bandwidth=800000",
         );
 
         // Audio stream - read from temp_dir, write to output_dir
-        expected_args.push("in=test_temp/audio.mp4,stream=audio,output=test_output/audio_en.mp4,language=en,bandwidth=128000");
+        expected_args.push("in=test_temp/audio.webm,stream=audio,output=test_output/audio_en.webm,language=en,bandwidth=128000");
 
         // Manifest and segment duration - write to output_dir
         expected_args.push("--mpd_output");
@@ -474,8 +438,8 @@ mod tests {
         // Add video streams
         for &(resolution, bitrate_kbps) in &quality_ladder {
             let bandwidth = bitrate_kbps * 1000;
-            let video_input_file = format!("{}/video_{}p.mp4", temp_dir, resolution);
-            let video_output_file = format!("{}/video_{}p.mp4", output_dir, resolution);
+            let video_input_file = format!("{}/video_{}p.webm", temp_dir, resolution);
+            let video_output_file = format!("{}/video_{}p.webm", output_dir, resolution);
             command.arg(format!(
                 "in={},stream=video,output={},bandwidth={}",
                 video_input_file, video_output_file, bandwidth
@@ -483,8 +447,8 @@ mod tests {
         }
 
         // Add audio stream
-        let audio_input_file = format!("{}/audio.mp4", temp_dir);
-        let audio_output_file = format!("{}/audio_en.mp4", output_dir);
+        let audio_input_file = format!("{}/audio.webm", temp_dir);
+        let audio_output_file = format!("{}/audio_en.webm", output_dir);
         command.arg(format!(
             "in={},stream=audio,output={},language=en,bandwidth=128000",
             audio_input_file, audio_output_file
@@ -519,10 +483,10 @@ fn finalize_transcoding(
     info!("fMP4 generation complete!");
     info!("Generated intermediate files in temporary directory:");
     for (resolution, _) in quality_ladder {
-        debug!("  - {:?}/video_{}p.mp4", temp_dir, resolution);
+        debug!("  - {:?}/video_{}p.webm", temp_dir, resolution);
     }
     for processor in audio_processors {
-        debug!("  - {:?}/audio_{}.mp4", temp_dir, processor.language);
+        debug!("  - {:?}/audio_{}.webm", temp_dir, processor.language);
     }
 
     // Call packager to generate DASH manifest
@@ -685,9 +649,7 @@ fn main() -> Result<()> {
         let audio_queue3 = gst::ElementFactory::make("queue").build()?;
 
         // Audio qtmux for fragmented MP4 output
-        let audio_qtmux = gst::ElementFactory::make("mp4mux")
-            .property("faststart", true)
-            .build()?;
+        let audio_qtmux = gst::ElementFactory::make("webmmux").build()?;
 
         // Audio filesink - write to temp directory with language code
         // Add stream index if there are duplicate language codes
@@ -697,7 +659,7 @@ fn main() -> Result<()> {
             String::new()
         };
         let audio_output_filename = temp_path.join(format!(
-            "audio_{}{}.mp4",
+            "audio_{}{}.webm",
             audio_stream.language, language_suffix
         ));
         let audio_filesink = gst::ElementFactory::make("filesink")

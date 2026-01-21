@@ -65,6 +65,7 @@ export class VideoWidget extends TypedEventTarget<VideoWidgetEventMap> {
   }
 
   public isBuffered(): boolean {
+    return true;
     const buffered = this.video.buffered;
     const currentTime = this.video.currentTime;
     const duration = this.video.duration;
@@ -77,8 +78,10 @@ export class VideoWidget extends TypedEventTarget<VideoWidgetEventMap> {
         console.log(bufferedSeconds);
 
         // Either we have enough buffer, OR we're buffered to the end
-        return bufferedSeconds >= BUFFER_THRESHOLD_SECONDS ||
-          bufferedSeconds >= remainingSeconds;
+        return (
+          bufferedSeconds >= BUFFER_THRESHOLD_SECONDS ||
+          bufferedSeconds >= remainingSeconds
+        );
       }
     }
     return false;
@@ -92,9 +95,8 @@ export class VideoWidget extends TypedEventTarget<VideoWidgetEventMap> {
 
   private bindUI(): void {
     this.playBtn.addEventListener("click", () => this.emit("play", undefined));
-    this.pauseBtn.addEventListener(
-      "click",
-      () => this.emit("pause", undefined),
+    this.pauseBtn.addEventListener("click", () =>
+      this.emit("pause", undefined),
     );
 
     this.fullscreenBtn.addEventListener("click", () => {
